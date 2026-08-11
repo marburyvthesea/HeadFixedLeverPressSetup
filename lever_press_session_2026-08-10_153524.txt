@@ -1,0 +1,10 @@
+Lever Press Session Summary
+============================
+Session start: 10-Aug-2026 15:05:19
+Session end:   10-Aug-2026 15:35:19
+Duration:      30.0 minutes
+
+Total presses (both levers): 6
+  Lever 1 presses: 1 (water delivered: 1)
+  Lever 2 presses: 5 (water delivered: 5)
+Total water deliveries: 6
