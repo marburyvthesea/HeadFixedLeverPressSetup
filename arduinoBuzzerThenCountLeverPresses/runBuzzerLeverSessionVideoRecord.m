@@ -30,7 +30,8 @@ sessionMinutes  = 30;       % total session duration (minutes)
 readyTimeout    = 10;       % seconds to wait for "READY" after connecting
 ackTimeout      = 5;        % seconds to wait for ACKs
 saveResults     = true;
-outFileBase     = "lever_press_session";
+outFileBase     = "m0709_1_FI_lever_press_session";
+maxWaterDeliveries = 100;
 
 %% ===================== CONNECT =====================
 % Clear any stale connection from a previous run (e.g. if the script
@@ -69,7 +70,7 @@ fprintf("Arduino connected and session started.\n");
 %% Video Recording Parameters
 videoFolder = 'D:\Data\JJM\HeadFixedLeverPress';         %folder for all mouse trial videos
 timestamp = datestr(now, 'mm_dd_yy_HH_MM_SS'); 
-mouseID = 'm2_t1';   %mouse ID
+mouseID = 'm07092026_01';   %mouse ID
 mouseID = strcat(mouseID, '_', timestamp);         % Update mouseID with timestamp
 newDirectory = strcat(videoFolder, mouseID); 
 mkdir(newDirectory);                                %creates new directory with mouseID as folder name
@@ -111,26 +112,36 @@ trialNum   = [];
 pressCount = [];
 sawPress = [];
 waterDelivered = [];
+lever1PressCount = [];   % NEW
+lever2PressCount = [];   % NEW
 trialStartWallClock = datetime.empty(0,1);
 trialEndWallClock   = datetime.empty(0,1);
-
 running = true;
 currentTrialStartTime = NaT;
 
 %% ===================== MAIN LOOP =====================
 while running
 
-    % Check time budget before/while waiting on Arduino
+    % Check time budget
     if datetime('now') >= sessionEnd
         fprintf("Session time budget reached. Sending STOP.\n");
         writeline(s, "STOP");
-        waitForLine(s, "ACK_STOP", ackTimeout); % best effort
+        waitForLine(s, "ACK_STOP", ackTimeout);
+        running = false;
+        break;
+    end
+
+    % Check water delivery limit
+    if sum(waterDelivered) >= maxWaterDeliveries
+        fprintf("Water delivery limit (%d) reached. Sending STOP.\n", maxWaterDeliveries);
+        writeline(s, "STOP");
+        waitForLine(s, "ACK_STOP", ackTimeout);
         running = false;
         break;
     end
 
     if s.NumBytesAvailable == 0
-        pause(0.02);           % small idle wait, avoid busy-spinning
+        pause(0.02);
         continue;
     end
 
@@ -151,35 +162,40 @@ while running
             nPress = str2double(tokens{3});
             saw = str2double(tokens{4});
             water = str2double(tokens{5});
+            lever1Cnt = str2double(tokens{6});
+            lever2Cnt = str2double(tokens{7});
             tEnd = datetime('now');
-
-            trialNum(end+1,1)   = tNum;   %#ok<*SAGROW>
+        
+            trialNum(end+1,1)   = tNum;
             pressCount(end+1,1) = nPress;
             sawPress(end+1,1)   = saw;
             waterDelivered(end+1,1) = water;
+            lever1PressCount(end+1,1) = lever1Cnt;
+            lever2PressCount(end+1,1) = lever2Cnt;
             trialStartWallClock(end+1,1) = currentTrialStartTime;
             trialEndWallClock(end+1,1) = tEnd;
-
-            fprintf("[%s] Trial %d ended: %d press(es), sawPress=%d, water=%d.\n", ...
-                datestr(tEnd,'HH:MM:SS'), tNum, nPress, saw, water);
+        
+            fprintf("[%s] Trial %d ended: %d press(es) [L1=%d, L2=%d], sawPress=%d, water=%d.\n", ...
+                datestr(tEnd,'HH:MM:SS'), tNum, nPress, lever1Cnt, lever2Cnt, saw, water);
             if water == 1
-                fprintf(" Water delivered.\n");
-                %fprintf('%d\n', saw);
+                fprintf(" Water delivered. Total so far: %d/%d\n", sum(waterDelivered), maxWaterDeliveries);
             else
                 fprintf(" No water delivered.\n");
-                %fprintf('0\n');
             end
-            %fprintf('%s\n', water);
-
-            % Decide whether to continue or stop based on remaining time
+        
+            % Decide whether to continue or stop: time budget OR water limit OR neither
             if datetime('now') >= sessionEnd
                 fprintf("Session time budget reached. Sending STOP.\n");
                 writeline(s, "STOP");
-                waitForLine(s, "ACK_STOP", ackTimeout); % best effort
+                waitForLine(s, "ACK_STOP", ackTimeout);
+                running = false;
+            elseif sum(waterDelivered) >= maxWaterDeliveries
+                fprintf("Water delivery limit (%d) reached. Sending STOP.\n", maxWaterDeliveries);
+                writeline(s, "STOP");
+                waitForLine(s, "ACK_STOP", ackTimeout);
                 running = false;
             else
                 writeline(s, "CONTINUE");
-                % Not strictly necessary to block on the ACK, but useful for logging
                 waitForLine(s, "ACK_CONTINUE", ackTimeout);
             end
 
@@ -206,7 +222,9 @@ delete(s);
 fprintf("Serial connection closed.\n");
 
 results = table(trialNum, trialStartWallClock, trialEndWallClock, pressCount, sawPress, waterDelivered, ...
-    'VariableNames', {'Trial','TrialStart','TrialEnd','PressCount','SawPress', 'WaterDelivered'});
+    lever1PressCount, lever2PressCount, ...
+    'VariableNames', {'Trial','TrialStart','TrialEnd','PressCount','SawPress','WaterDelivered', ...
+    'Lever1PressCount','Lever2PressCount'});
 
 fprintf("\nSession complete: %d trials in %.1f minutes.\n", height(results), sessionMinutes);
 disp(results);
@@ -218,6 +236,52 @@ if saveResults
      writetable(results, csvName);
      save(matName, 'results', 'sessionStart', 'sessionEnd', 'sessionMinutes');
      fprintf("Results saved to %s and %s\n", csvName, matName);
+
+     % ---- Summary stats ----
+     totalTrials  = height(results);
+     trialsWithPress = sum(results.SawPress == 1);
+     totalWater   = sum(results.WaterDelivered);
+     lever1Total  = sum(results.Lever1PressCount);
+     lever2Total  = sum(results.Lever2PressCount);
+
+     % ---- Water delivery timing detail ----
+     waterTrials = results(results.WaterDelivered == 1, {'Trial','TrialStart','TrialEnd','Lever1PressCount','Lever2PressCount'});
+
+     % ---- Excel export: raw trials + summary + water timing on separate sheets ----
+     xlsxName = sprintf('%s_%s.xlsx', outFileBase, timestamp);
+     writetable(results, xlsxName, 'Sheet', 'RawTrials');
+
+     summaryTable = table( ...
+         ["Total trials"; "Trials with any press"; "Total water deliveries"; ...
+          "Lever 1 total presses"; "Lever 2 total presses"], ...
+         [totalTrials; trialsWithPress; totalWater; lever1Total; lever2Total], ...
+         'VariableNames', {'Metric','Value'});
+     writetable(summaryTable, xlsxName, 'Sheet', 'Summary');
+
+     writetable(waterTrials, xlsxName, 'Sheet', 'WaterDeliveryTimes');
+     fprintf("Excel file saved to %s\n", xlsxName);
+
+     % % ---- Plain text summary ----
+     % txtName = sprintf('%s_%s.txt', outFileBase, timestamp);
+     % fid = fopen(txtName, 'w');
+     % fprintf(fid, "Lever Press Session Summary\n");
+     % fprintf(fid, "============================\n");
+     % fprintf(fid, "Session start: %s\n", datestr(sessionStart));
+     % fprintf(fid, "Session end:   %s\n", datestr(sessionEnd));
+     % fprintf(fid, "Duration:      %.1f minutes\n\n", sessionMinutes);
+     % fprintf(fid, "Total trials: %d\n", totalTrials);
+     % fprintf(fid, "Trials with any press: %d\n", trialsWithPress);
+     % fprintf(fid, "Lever 1 total presses: %d\n", lever1Total);
+     % fprintf(fid, "Lever 2 total presses: %d\n", lever2Total);
+     % fprintf(fid, "Total water deliveries: %d/%d\n\n", totalWater, maxWaterDeliveries);
+     % fprintf(fid, "Water delivery times:\n");
+     % for i = 1:height(waterTrials)
+     %     fprintf(fid, "  Trial %d at %s (L1=%d, L2=%d presses that trial)\n", ...
+     %         waterTrials.Trial(i), datestr(waterTrials.TrialEnd(i),'HH:MM:SS'), ...
+     %         waterTrials.Lever1PressCount(i), waterTrials.Lever2PressCount(i));
+     % end
+     % fclose(fid);
+     % fprintf("Text summary saved to %s\n", txtName);
 end
 
 % %% ===================== PLOT =====================

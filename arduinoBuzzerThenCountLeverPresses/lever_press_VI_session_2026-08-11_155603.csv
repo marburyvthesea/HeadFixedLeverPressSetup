@@ -1,0 +1,5 @@
+Trial,TrialStart,TrialEnd,CutoffOffsetMs,PressCount,SawPress,WaterDelivered,Lever1PressCount,Lever2PressCount,EarlyPressCount,LatePressCount
+1,11-Aug-2026 15:54:58,11-Aug-2026 15:54:58,8836,0,0,0,0,0,0,0
+2,11-Aug-2026 15:54:59,11-Aug-2026 15:55:14,7845,0,0,0,0,0,0,0
+3,11-Aug-2026 15:55:15,11-Aug-2026 15:55:30,11131,0,0,0,0,0,0,0
+4,11-Aug-2026 15:55:31,11-Aug-2026 15:55:46,6129,0,0,0,0,0,0,0
