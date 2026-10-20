@@ -26,11 +26,11 @@ clear; clc;
 %% ===================== USER SETTINGS =====================
 portName        = "COM4";   % <-- change to your Arduino's port (e.g. "COM3" or "/dev/tty.usbmodem14101")
 baudRate        = 115200;   % must match Serial.begin() in the sketch
-sessionMinutes  = 30;       % total session duration (minutes)
+sessionMinutes  = 5;       % total session duration (minutes)
 readyTimeout    = 10;       % seconds to wait for "READY" after connecting
 ackTimeout      = 5;        % seconds to wait for ACKs
 saveResults     = true;
-outFileBase     = "m0709_1_FI_lever_press_session";
+outFileBase     = "m0710_1_Devaluation_session";
 maxWaterDeliveries = 100;
 
 %% ===================== CONNECT =====================
@@ -70,7 +70,7 @@ fprintf("Arduino connected and session started.\n");
 %% Video Recording Parameters
 videoFolder = 'D:\Data\JJM\HeadFixedLeverPress';         %folder for all mouse trial videos
 timestamp = datestr(now, 'mm_dd_yy_HH_MM_SS'); 
-mouseID = 'm07092026_01';   %mouse ID
+mouseID = 'm07102026_01';   %mouse ID
 mouseID = strcat(mouseID, '_', timestamp);         % Update mouseID with timestamp
 newDirectory = strcat(videoFolder, mouseID); 
 mkdir(newDirectory);                                %creates new directory with mouseID as folder name

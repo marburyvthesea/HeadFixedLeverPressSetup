@@ -49,7 +49,7 @@ interTrialDelaySec = 1;       % Brief delay after a reward before the next cue.
 readyTimeout       = 10;      % Seconds to wait for the Arduino after connect.
 ackTimeout         = 5;       % Seconds to wait for command acknowledgements.
 saveResults        = true;
-outFileBase        = "omission_lever_session";
+outFileBase        = "m0710_02_omission_lever_session";
 
 % Preserve the original Arduino hardware constants.  These are sent to the
 % omission firmware in OMISSION_CONFIG; keep them matched to the firmware.
@@ -65,8 +65,8 @@ buzzerDurationMs   = 500;
 valvePulseMs       = 220;
 
 % Video settings preserved from runBuzzerLeverSessionVideoRecord.m.
-videoFolder        = 'D:\Data\JJM\HeadFixedLeverPress';
-mouseIDPrefix      = 'mouse_omission';
+videoFolder        = 'D:\Data\JJM\HeadFixedLeverPress\08-31-2026';
+mouseIDPrefix      = 'm0710_02_omission';
 videoAdaptor       = 'winvideo';
 videoDeviceID      = 2;
 videoFormat        = 'Y800_640x480';

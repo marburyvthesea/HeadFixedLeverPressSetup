@@ -1,0 +1,21 @@
+Timestamp,Event,Interval,Detail
+31-Aug-2026 12:20:56,INTERVAL_START,1,buzzer sounded
+31-Aug-2026 12:21:16,REWARD,1,valvePulseMs=220
+31-Aug-2026 12:21:16,INTERVAL_END,1,outcome=REWARD; presses=0
+31-Aug-2026 12:21:17,INTERVAL_START,2,buzzer sounded
+31-Aug-2026 12:21:20,LEVER_PRESS,2,lever=1
+31-Aug-2026 12:21:20,INTERVAL_RESET,2,resetDelaySec=1.000
+31-Aug-2026 12:21:20,INTERVAL_END,2,outcome=RESET; presses=1
+31-Aug-2026 12:21:21,INTERVAL_START,3,buzzer sounded
+31-Aug-2026 12:21:41,REWARD,3,valvePulseMs=220
+31-Aug-2026 12:21:41,INTERVAL_END,3,outcome=REWARD; presses=0
+31-Aug-2026 12:21:42,INTERVAL_START,4,buzzer sounded
+31-Aug-2026 12:22:02,REWARD,4,valvePulseMs=220
+31-Aug-2026 12:22:02,INTERVAL_END,4,outcome=REWARD; presses=0
+31-Aug-2026 12:22:03,INTERVAL_START,5,buzzer sounded
+31-Aug-2026 12:22:23,REWARD,5,valvePulseMs=220
+31-Aug-2026 12:22:23,INTERVAL_END,5,outcome=REWARD; presses=0
+31-Aug-2026 12:22:24,INTERVAL_START,6,buzzer sounded
+31-Aug-2026 12:22:44,REWARD,6,valvePulseMs=220
+31-Aug-2026 12:22:44,INTERVAL_END,6,outcome=REWARD; presses=0
+31-Aug-2026 12:22:45,INTERVAL_START,7,buzzer sounded

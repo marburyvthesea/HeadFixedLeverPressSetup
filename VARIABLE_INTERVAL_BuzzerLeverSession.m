@@ -29,7 +29,7 @@ sessionMinutes      = 30;      % total session duration (minutes)
 maxWaterDeliveries  = 100;     % stop early once this many rewards given
 ackTimeout          = 5;
 saveResults         = true;
-outFileBase         = "m0713_1_lever_press_VI_session";
+outFileBase         = "m0708_2_VI_session";
 
 %% ===================== CONNECT =====================
 if exist('s','var')
@@ -69,7 +69,7 @@ fprintf("Arduino connected and session started.\n");
 %% ===================== VIDEO RECORDING SETUP =====================
 videoFolder = 'D:\Data\JJM\HeadFixedLeverPress';
 timestamp = datestr(now, 'mm_dd_yy_HH_MM_SS');
-mouseID = 'm07132026_01';
+mouseID = 'm07082026_01';
 mouseID = strcat(mouseID, '_', timestamp);
 newDirectory = strcat(videoFolder, mouseID);
 mkdir(newDirectory);
