@@ -34,14 +34,14 @@ sessionMinutes  = 30;       % total session duration (minutes)
 readyTimeout    = 10;       % seconds to wait for "READY" after connecting
 ackTimeout      = 5;        % seconds to wait for ACKs
 saveResults     = true;
-outFileBase     = "m6255";
-maxPresses = 100; % Includes inactive-lever presses.
-activeLevers = "LEVER1"; % "BOTH", "LEVER1", or "LEVER2"; choose before START SESSION.
+outFileBase     = "m4850";
+maxPresses = 100; % Counts active-lever presses only.
+activeLevers = "LEVER2"; % "BOTH", "LEVER1 - closer to computer", or "LEVER2"; choose before START SESSION.
 
 %% Video Recording Parameters
 videoFolder = 'D:\Data\JJM\HeadFixedLeverPress';         %folder for all mouse trial videos
 timestamp = datestr(now, 'mm_dd_yy_HH_MM_SS'); 
-mouseID = 'm1825';   %mouse ID
+mouseID = 'm4850';   %mouse ID
 mouseID = strcat(mouseID, '_', timestamp);         % Update mouseID with timestamp
 newDirectory = fullfile(videoFolder, mouseID); 
 mkdir(newDirectory);                                %creates new directory with mouseID as folder name
@@ -133,7 +133,7 @@ sessionEnd   = sessionStart + minutes(sessionMinutes);
 fprintf("Session started at %s. Will run until %s (%.1f min).\n", ...
     datestr(sessionStart), datestr(sessionEnd), sessionMinutes);
 
-%% ===================== MAIN LOOP =====================
+% ===================== MAIN LOOP =====================
 % One row per logged press, rewarded or not. Run once per session.
 pressNum = zeros(0,1);
 leverUsed = zeros(0,1);
@@ -153,8 +153,17 @@ while running
         stopTimer = tic;
     end
 
-    if ~stopRequested && numel(pressNum) >= maxPresses
-        fprintf("Press limit (%d) reached. Sending STOP.\n", maxPresses);
+    switch sessionActiveLevers
+        case "LEVER1"
+            activePressCount = sum(leverUsed == 1);
+        case "LEVER2"
+            activePressCount = sum(leverUsed == 2);
+        case "BOTH"
+            activePressCount = numel(leverUsed);
+    end
+
+    if ~stopRequested && activePressCount >= maxPresses
+        fprintf("Active-lever press limit (%d) reached. Sending STOP.\n", maxPresses);
         writeline(s, "STOP");
         stopRequested = true;
         stopTimer = tic;
@@ -296,7 +305,8 @@ if saveResults
     fprintf(fid, "Active levers: %s (fixed for this session)\n", sessionActiveLevers);
     fprintf(fid, "Lever 1 active: %d\n", ismember(sessionActiveLevers, ["BOTH", "LEVER1"]));
     fprintf(fid, "Lever 2 active: %d\n", ismember(sessionActiveLevers, ["BOTH", "LEVER2"]));
-    fprintf(fid, "Press limit: %d (includes both active and inactive presses)\n", maxPresses);
+    fprintf(fid, "Press limit: %d active-lever presses only; active mode: %s\n", ...
+    maxPresses, sessionActiveLevers);
     fprintf(fid, "WaterDelivered=1 means valve commanded on, not measured flow.\n");
     fprintf(fid, "WaterDelivered=0 means inactive press or queued reward canceled by STOP.\n\n");
     fprintf(fid, "Total presses (both levers): %d\n", totalPresses);
