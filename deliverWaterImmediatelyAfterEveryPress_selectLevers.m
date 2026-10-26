@@ -34,14 +34,14 @@ sessionMinutes  = 30;       % total session duration (minutes)
 readyTimeout    = 10;       % seconds to wait for "READY" after connecting
 ackTimeout      = 5;        % seconds to wait for ACKs
 saveResults     = true;
-outFileBase     = "m4850";
+outFileBase     = "m7287";
 maxPresses = 100; % Counts active-lever presses only.
-activeLevers = "LEVER2"; % "BOTH", "LEVER1 - closer to computer", or "LEVER2"; choose before START SESSION.
+activeLevers = "LEVER1"; % "BOTH", "LEVER1 - closer to computer", or "LEVER2"; choose before START SESSION.
 
 %% Video Recording Parameters
 videoFolder = 'D:\Data\JJM\HeadFixedLeverPress';         %folder for all mouse trial videos
 timestamp = datestr(now, 'mm_dd_yy_HH_MM_SS'); 
-mouseID = 'm4850';   %mouse ID
+mouseID = 'm7287';   %mouse ID
 mouseID = strcat(mouseID, '_', timestamp);         % Update mouseID with timestamp
 newDirectory = fullfile(videoFolder, mouseID); 
 mkdir(newDirectory);                                %creates new directory with mouseID as folder name
