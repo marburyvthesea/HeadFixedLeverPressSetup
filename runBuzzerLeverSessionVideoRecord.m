@@ -26,11 +26,11 @@ clear; clc;
 %% ===================== USER SETTINGS =====================
 portName        = "COM4";   % <-- change to your Arduino's port (e.g. "COM3" or "/dev/tty.usbmodem14101")
 baudRate        = 115200;   % must match Serial.begin() in the sketch
-sessionMinutes  = 30;       % total session duration (minutes)
+sessionMinutes  = 1;       % total session duration (minutes)
 readyTimeout    = 10;       % seconds to wait for "READY" after connecting
 ackTimeout      = 5;        % seconds to wait for ACKs
 saveResults     = true;
-outFileBase     = "lever_press_session";
+outFileBase     = "test_FI_15";
 
 %% ===================== CONNECT =====================
 % Clear any stale connection from a previous run (e.g. if the script
@@ -69,13 +69,13 @@ fprintf("Arduino connected and session started.\n");
 %% Video Recording Parameters
 videoFolder = 'D:\Data\JJM\HeadFixedLeverPress';         %folder for all mouse trial videos
 timestamp = datestr(now, 'mm_dd_yy_HH_MM_SS'); 
-mouseID = 'm2_t1';   %mouse ID
+mouseID = 'test_FI_15';   %mouse ID
 mouseID = strcat(mouseID, '_', timestamp);         % Update mouseID with timestamp
 newDirectory = strcat(videoFolder, mouseID); 
 mkdir(newDirectory);                                %creates new directory with mouseID as folder name
 fileName = strcat(newDirectory, "\", mouseID, "_T", '.avi');
 %establish video settings
-vid = videoinput('winvideo', 2, 'Y800_640x480'); % Change to 'gentl'/'winvideo' if preferred
+vid = videoinput('winvideo', 1, 'Y800_640x480'); % Change to 'gentl'/'winvideo' if preferred
 src = getselectedsource(vid);
 src.FrameRate = '120.0005'; % Set the desired frame rate
 % log frames directly to disk in the background

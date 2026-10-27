@@ -37,7 +37,7 @@ sessionMinutes  = 30;       % total session duration (minutes)
 readyTimeout    = 10;       % seconds to wait for "READY" after connecting
 ackTimeout      = 5;        % seconds to wait for ACKs
 saveResults     = true;
-outFileBase     = "lever_press_session";
+outFileBase     = "m6880_FI_15";
 activeLevers    = "LEVER2"; % "BOTH", "LEVER1", or "LEVER2"
 trialSeconds    = 15;       % Response window: e.g. 15 or 30 seconds
 interTrialSeconds = 1;      % Pause AFTER reward completion (or an unrewarded trial)
@@ -81,13 +81,13 @@ fprintf("Arduino connected; rewards remain disabled until START SESSION.\n");
 %% Video Recording Parameters
 videoFolder = 'D:\Data\JJM\HeadFixedLeverPress';         %folder for all mouse trial videos
 timestamp = datestr(now, 'mm_dd_yy_HH_MM_SS'); 
-mouseID = 'm2_t1';   %mouse ID
+mouseID = 'm6880_FI_15';   %mouse ID
 mouseID = strcat(mouseID, '_', timestamp);         % Update mouseID with timestamp
 newDirectory = fullfile(videoFolder, mouseID); 
 mkdir(newDirectory);                                %creates new directory with mouseID as folder name
 fileName = fullfile(newDirectory, [mouseID '_T.avi']);
 %establish video settings
-vid = videoinput('winvideo', 2, 'Y800_640x480'); % Change to 'gentl'/'winvideo' if preferred
+vid = videoinput('winvideo', 1, 'Y800_640x480'); % Change to 'gentl'/'winvideo' if preferred
 src = getselectedsource(vid);
 src.FrameRate = '120.0005'; % Set the desired frame rate
 % log frames directly to disk in the background
@@ -173,7 +173,7 @@ stopAcknowledged = false;
 stopTimer = [];
 currentTrialStartTime = NaT;
 
-%% ===================== MAIN LOOP =====================
+% ===================== MAIN LOOP =====================
 while running
     if ~stopRequested && datetime('now') >= sessionEnd
         fprintf("Session time budget reached. Sending STOP.\n");
@@ -278,7 +278,7 @@ end
 delete(vid);
 clear vid
 disp(['Video saved as ', fileName]);
-%% ===================== CLEAN UP =====================
+% ===================== CLEAN UP =====================
 delete(s);
 fprintf("Serial connection closed.\n");
 
@@ -293,7 +293,7 @@ results.ActiveLevers = repmat(sessionActiveLevers, height(results), 1);
 fprintf("\nSession complete: %d completed, %d aborted trials in %.2f minutes.\n", ...
     sum(trialCompleted), sum(~trialCompleted), actualMinutes);
 disp(results);
-%%
+%
 if saveResults
     timestamp = datestr(now, 'yyyy-mm-dd_HHMMSS');
     sessionOutputBase = string(fullfile(newDirectory, sprintf('%s_%s', outFileBase, timestamp)));
