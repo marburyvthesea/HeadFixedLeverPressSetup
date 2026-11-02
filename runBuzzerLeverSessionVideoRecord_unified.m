@@ -37,7 +37,7 @@ sessionMinutes  = 30;       % total session duration (minutes)
 readyTimeout    = 10;       % seconds to wait for "READY" after connecting
 ackTimeout      = 5;        % seconds to wait for ACKs
 saveResults     = true;
-outFileBase     = "m6880_FI_15";
+outFileBase     = "m5650_FI_15";
 activeLevers    = "LEVER2"; % "BOTH", "LEVER1", or "LEVER2"
 trialSeconds    = 15;       % Response window: e.g. 15 or 30 seconds
 interTrialSeconds = 1;      % Pause AFTER reward completion (or an unrewarded trial)
@@ -81,7 +81,7 @@ fprintf("Arduino connected; rewards remain disabled until START SESSION.\n");
 %% Video Recording Parameters
 videoFolder = 'D:\Data\JJM\HeadFixedLeverPress';         %folder for all mouse trial videos
 timestamp = datestr(now, 'mm_dd_yy_HH_MM_SS'); 
-mouseID = 'm6880_FI_15';   %mouse ID
+mouseID = 'm5650_FI_15';   %mouse ID
 mouseID = strcat(mouseID, '_', timestamp);         % Update mouseID with timestamp
 newDirectory = fullfile(videoFolder, mouseID); 
 mkdir(newDirectory);                                %creates new directory with mouseID as folder name

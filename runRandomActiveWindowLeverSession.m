@@ -18,15 +18,15 @@ clear; clc;
 %% ===================== USER SETTINGS =====================
 portName        = "COM4";   % <-- change to your Arduino's port (e.g. "COM3" or "/dev/tty.usbmodem14101")
 baudRate        = 115200;   % must match Serial.begin() in the sketch
-sessionMinutes  = 30;       % total session duration (minutes)
+sessionMinutes  = 40;       % total session duration (minutes)
 readyTimeout    = 10;       % seconds to wait for "READY" after connecting
 ackTimeout      = 5;        % seconds to wait for ACKs
 saveResults     = true;
-outFileBase     = "m6880_random_window";
+outFileBase     = "m4850_VI_80";
 activeLevers    = "LEVER2"; % "BOTH", "LEVER1", or "LEVER2"
-trialSeconds    = 15;       % Total trial duration: e.g. 15 or 30 seconds
-windowStartRangeSeconds = [1 8];    % Random onset after trial/buzzer onset
-activeWindowLengthRangeSeconds = [2 5]; % Random length; [3 3] means fixed 3 seconds
+trialSeconds    = 15;       % Total trial duration: e.g. 15 or 30 seconds % VI 80 
+windowStartRangeSeconds = [0 3];    % Random onset after trial/buzzer onset % VI 80 is [0 3], VI 60 is [0 6]
+activeWindowLengthRangeSeconds = [12 12]; % Random length; [3 3] means fixed 3 seconds % VI 80 is [12 12], VI 60 is [9 9]
 randomSeed = [];                    % [] chooses/saves a new seed; integer repeats a schedule
 maxWaterDeliveries = 100;           % Inf disables reward cap; session time limit still applies
 interTrialSeconds = 1;      % Pause AFTER reward completion (or an unrewarded trial)
@@ -70,7 +70,7 @@ fprintf("Arduino connected; rewards remain disabled until START SESSION.\n");
 %% Video Recording Parameters
 videoFolder = 'D:\Data\JJM\HeadFixedLeverPress';         %folder for all mouse trial videos
 timestamp = datestr(now, 'mm_dd_yy_HH_MM_SS');
-mouseID = 'm6880_random_window';   %mouse ID
+mouseID = 'm4850_VI_80';   %mouse ID
 mouseID = strcat(mouseID, '_', timestamp);         % Update mouseID with timestamp
 newDirectory = fullfile(videoFolder, mouseID);
 mkdir(newDirectory);                                %creates new directory with mouseID as folder name
