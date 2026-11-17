@@ -7,32 +7,27 @@
 % that interval, delivers NO water, waits resetDelaySec, then starts a new
 % cued interval.  Thus pressing delays (rather than earns) water.
 %
-% IMPORTANT -- this controller requires an omission-capable Arduino sketch.
-% The repository's original arduinoBuzzerThenCountLeverPresses.ino implements
-% a fixed-interval press-to-reward contingency and only understands START,
-% CONTINUE, and STOP.  It cannot implement immediate resets from MATLAB
-% alone.  Flash firmware that implements the serial contract listed below
-% before running this file; the original buzzer/valve pin assignments and
-% timing constants are reproduced in USER SETTINGS for that firmware.
+% Requires the unified leverTaskControllerWindow.ino firmware, which remains
+% backward-compatible with its IMMEDIATE, TRIAL, and WINDOW modes. This
+% script selects its additional OMISSION mode before starting the session.
 %
 % Required Arduino serial contract (one LF-terminated line per message):
-%   MATLAB -> OMISSION_CONFIG,<intervalMs>,<resetDelayMs>,<itiMs>,...
-%   MATLAB -> START_OMISSION
-%   Arduino -> ACK_OMISSION_CONFIG
-%   Arduino -> ACK_START_OMISSION
-%   Arduino -> INTERVAL_START,<intervalNumber>
-%   Arduino -> LEVER_PRESS,<intervalNumber>,<leverNumber>
+%   MATLAB -> SET_TASK,OMISSION
+%   MATLAB -> SET_ACTIVE,BOTH|LEVER1|LEVER2
+%   MATLAB -> SET_OMISSION,<intervalMs>,<resetMs>,<itiMs>,<buzzerMs>,<Hz>
+%   Arduino -> matching ACK_TASK, ACK_ACTIVE, and ACK_OMISSION lines
+%   MATLAB -> START
+%   Arduino -> ACK_START
+%   Arduino -> INTERVAL_START,<intervalNumber>,<ArduinoMs>
+%   Arduino -> LEVER_PRESS,<intervalNumber>,<leverNumber>,<ArduinoMs>
 %   Arduino -> INTERVAL_RESET,<intervalNumber>
 %   Arduino -> REWARD,<intervalNumber>
 %   Arduino -> INTERVAL_END,<intervalNumber>,REWARD|RESET,<pressCount>
 %   MATLAB -> STOP
 %   Arduino -> ACK_STOP
 %
-% The Arduino must: sound the buzzer at every INTERVAL_START; monitor both
-% levers with the same debounce handling as the original sketch; pulse the
-% valve at interval end only if no press occurred; and ignore presses during
-% the reset/inter-trial delay.  It must produce INTERVAL_RESET immediately
-% after the first valid press so MATLAB can log the cancellation precisely.
+% The Arduino handles timing and the reversed contingency locally, including
+% immediate cancellation, valve timing, and automatic post-reset/reward gaps.
 
 function runOmissionLeverSessionVideoRecord
 % The function form lets the nested event logger share the session state.
@@ -46,13 +41,12 @@ sessionDurationMin = 30;
 omissionIntervalSec = 20;     % Required press-free duration for one reward.
 resetDelaySec      = 1;       % Brief delay after a press before the next cue.
 interTrialDelaySec = 1;       % Brief delay after a reward before the next cue.
-readyTimeout       = 10;      % Seconds to wait for the Arduino after connect.
 ackTimeout         = 5;       % Seconds to wait for command acknowledgements.
 saveResults        = true;
 outFileBase        = "m0710_02_omission_lever_session";
+activeLevers       = "BOTH";  % "BOTH", "LEVER1", or "LEVER2" reset the timer.
 
-% Preserve the original Arduino hardware constants.  These are sent to the
-% omission firmware in OMISSION_CONFIG; keep them matched to the firmware.
+% Hardware constants documented here must match the unified Arduino firmware.
 lever1NoPin        = 2;       %#ok<NASGU> % Documentation for firmware setup.
 lever1NcPin        = 3;       %#ok<NASGU>
 lever2NoPin        = 9;       %#ok<NASGU>
@@ -85,22 +79,22 @@ pause(2);                         % Allow the Arduino bootloader to finish.
 flush(s);
 
 fprintf("Connecting to Arduino...\n");
-if ~waitForLine(s, "READY", readyTimeout)
-    % Some existing sketches print READY only once during startup.  Continue
-    % to the explicit omission configuration handshake if it was missed.
-    warning("Did not receive READY; attempting omission configuration.");
+maxRetries = 10;
+connected = false;
+for attempt = 1:maxRetries
+    flush(s);
+    writeline(s, "STOP");       % Verify connection with rewards disabled.
+    if waitForLine(s, "ACK_STOP", 1.5)
+        connected = true;
+        break;
+    end
+    fprintf("No response on attempt %d/%d, retrying...\n", attempt, maxRetries);
 end
-
-configCommand = sprintf("OMISSION_CONFIG,%d,%d,%d,%d,%d,%d,%d", ...
-    round(omissionIntervalSec * 1000), round(resetDelaySec * 1000), ...
-    round(interTrialDelaySec * 1000), debounceMs, buzzerFreqHz, ...
-    buzzerDurationMs, valvePulseMs);
-writeline(s, configCommand);
-if ~waitForLine(s, "ACK_OMISSION_CONFIG", ackTimeout)
+if ~connected
     delete(s);
-    error(["The Arduino did not acknowledge OMISSION_CONFIG. Flash the " + ...
-        "matching omission-capable firmware before running this script."]);
+    error("Could not get ACK_STOP from Arduino after %d attempts. Check port/wiring.", maxRetries);
 end
+fprintf("Arduino connected; rewards remain disabled until START.\n");
 
 %% ===================== VIDEO RECORDING PARAMETERS =====================
 timestamp = datestr(now, 'mm_dd_yy_HH_MM_SS');
@@ -123,16 +117,50 @@ vid.ReturnedColorSpace = 'grayscale';
 vid.FramesPerTrigger = Inf;
 
 %% ===================== START SESSION =====================
+% Validate and configure the unified firmware while it is stopped.
+activeLevers = upper(strtrim(string(activeLevers)));
+if ~isscalar(activeLevers) || ~ismember(activeLevers, ["BOTH","LEVER1","LEVER2"])
+    error('activeLevers must be "BOTH", "LEVER1", or "LEVER2".');
+end
+validateattributes(sessionDurationMin, {'numeric'}, {'scalar','finite','positive'});
+validateattributes(omissionIntervalSec, {'numeric'}, {'scalar','finite','>=',0.001,'<=',3600});
+validateattributes(resetDelaySec, {'numeric'}, {'scalar','finite','>=',0,'<=',3600});
+validateattributes(interTrialDelaySec, {'numeric'}, {'scalar','finite','>=',0,'<=',3600});
+validateattributes(buzzerDurationMs, {'numeric'}, {'scalar','integer','>=',0});
+validateattributes(buzzerFreqHz, {'numeric'}, {'scalar','integer','>=',31,'<=',20000});
+if buzzerDurationMs > round(1000 * omissionIntervalSec)
+    error('buzzerDurationMs cannot exceed the omission interval.');
+end
+omissionSettingsMs = [round(1000 * omissionIntervalSec), ...
+    round(1000 * resetDelaySec), round(1000 * interTrialDelaySec)];
+omissionValues = sprintf('%d,%d,%d,%d,%d', omissionSettingsMs(1), ...
+    omissionSettingsMs(2), omissionSettingsMs(3), buzzerDurationMs, buzzerFreqHz);
+commands = ["SET_TASK,OMISSION", "SET_ACTIVE," + activeLevers, ...
+    "SET_OMISSION," + omissionValues];
+expectedAcks = ["ACK_TASK,OMISSION", "ACK_ACTIVE," + activeLevers, ...
+    "ACK_OMISSION," + omissionValues];
+for configIndex = 1:numel(commands)
+    writeline(s, commands(configIndex));
+    if ~waitForLine(s, expectedAcks(configIndex), ackTimeout)
+        delete(s);
+        error("Configuration not confirmed. Upload the updated leverTaskControllerWindow.ino.");
+    end
+end
+sessionActiveLevers = activeLevers;
+omissionIntervalSec = omissionSettingsMs(1) / 1000;
+resetDelaySec = omissionSettingsMs(2) / 1000;
+interTrialDelaySec = omissionSettingsMs(3) / 1000;
+
 open(vw);
 preview(vid);
 triggerconfig(vid, 'immediate');
 start(vid);
 disp('Video recording started.');
 
-writeline(s, "START_OMISSION");
-if ~waitForLine(s, "ACK_START_OMISSION", ackTimeout)
-    stopAndClose(vid, vw, s);
-    error("Arduino did not acknowledge START_OMISSION.");
+writeline(s, "START");
+if ~waitForLine(s, "ACK_START", ackTimeout)
+    stopAndClose(vid, vw, s, true);
+    error("Arduino did not acknowledge START.");
 end
 
 sessionStart = datetime('now');
@@ -162,13 +190,20 @@ currentPressCount = 0;
 currentFirstPress = NaT;
 currentFirstPressLever = NaN;
 running = true;
+stopRequested = false;
+stopAcknowledged = false;
+stopTimer = [];
 
 %% ===================== MAIN LOOP =====================
 while running
-    if datetime('now') >= sessionEnd
+    if ~stopRequested && datetime('now') >= sessionEnd
         fprintf("Session time budget reached. Sending STOP.\n");
         writeline(s, "STOP");
-        waitForLine(s, "ACK_STOP", ackTimeout);
+        stopRequested = true;
+        stopTimer = tic;
+    end
+    if stopRequested && toc(stopTimer) >= ackTimeout
+        warning("STOP acknowledgment timed out; saving received interval records.");
         break;
     end
 
@@ -239,7 +274,11 @@ while running
             addEvent("INTERVAL_END", endedInterval, ...
                 sprintf("outcome=%s; presses=%d", endedOutcome, endedPressCount));
 
-        case {"ACK_OMISSION_CONFIG", "ACK_START_OMISSION", "ACK_STOP"}
+        case "ACK_STOP"
+            stopAcknowledged = true;
+            running = false;
+
+        case {"ACK_TASK", "ACK_ACTIVE", "ACK_OMISSION", "ACK_START"}
             % Handshake acknowledgements are normally consumed by waitForLine.
 
         otherwise
@@ -248,13 +287,14 @@ while running
 end
 
 %% ===================== CLEAN UP =====================
-stopAndClose(vid, vw, s);
+stopAndClose(vid, vw, s, ~stopAcknowledged);
 disp(['Video saved as ', fileName]);
 
 results = table(intervalNumber, intervalStartWallClock, intervalEndWallClock, ...
     pressCount, firstPressWallClock, firstPressLever, outcome, waterDelivered, ...
     'VariableNames', {'Interval', 'IntervalStart', 'IntervalEnd', 'PressCount', ...
     'FirstPressTime', 'FirstPressLever', 'Outcome', 'WaterDelivered'});
+results.ActiveLevers = repmat(sessionActiveLevers, height(results), 1);
 eventLog = table(eventTime, eventType, eventInterval, eventDetail, ...
     'VariableNames', {'Timestamp', 'Event', 'Interval', 'Detail'});
 
@@ -272,7 +312,8 @@ if saveResults
     save(matName, 'results', 'eventLog', 'sessionStart', 'sessionEnd', ...
         'sessionDurationMin', 'omissionIntervalSec', 'resetDelaySec', ...
         'interTrialDelaySec', 'debounceMs', 'buzzerFreqHz', ...
-        'buzzerDurationMs', 'valvePulseMs', 'fileName');
+        'buzzerDurationMs', 'valvePulseMs', 'sessionActiveLevers', ...
+        'stopAcknowledged', 'fileName');
     fprintf("Results saved to %s, %s, and %s\n", ...
         resultsCsvName, eventsCsvName, matName);
 end
@@ -305,9 +346,11 @@ function addEvent(type, interval, detail)
     eventDetail(end+1, 1) = string(detail); %#ok<AGROW>
 end
 
-function stopAndClose(videoObj, writerObj, serialObj)
+function stopAndClose(videoObj, writerObj, serialObj, sendStop)
 % Preserve the original script's video and serial shutdown sequence.
-    try writeline(serialObj, "STOP"); catch, end
+    if sendStop
+        try writeline(serialObj, "STOP"); catch, end
+    end
     try stop(videoObj); catch, end
     try closepreview(videoObj); catch, end
     try close(writerObj); catch, end

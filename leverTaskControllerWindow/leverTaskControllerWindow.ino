@@ -5,7 +5,7 @@
   NEVER connect the 24 V valve directly to an Arduino pin.
 
   Configure while stopped:
-    SET_TASK,IMMEDIATE / TRIAL / WINDOW -> ACK_TASK,<task>
+    SET_TASK,IMMEDIATE / TRIAL / WINDOW / OMISSION -> ACK_TASK,<task>
     SET_ACTIVE,BOTH / LEVER1 / LEVER2 -> ACK_ACTIVE,<selection>
     SET_TRIAL,<windowMs>,<pauseMs>,<buzzerMs>,<frequencyHz>
       -> ACK_TRIAL,<same four values>
@@ -13,8 +13,10 @@
       -> ACK_WINDOW,<same five values>. Send AFTER SET_TRIAL.
     Bounds: startMax+lengthMax <= trial duration, lengthMin >= 1 ms.
     Seed: integer 1..2147483646. WINDOW settings required before START.
+    SET_OMISSION,<intervalMs>,<resetDelayMs>,<rewardPauseMs>,<buzzerMs>,<frequencyHz>
+      -> ACK_OMISSION,<same five values>. OMISSION settings required before START.
   START -> ACK_START. STOP -> ACK_STOP after current pulse finishes.
-  CONTINUE -> ACK_CONTINUE,<last trial number> (TRIAL mode only).
+  CONTINUE -> ACK_CONTINUE,<last trial number> (TRIAL/WINDOW modes only).
 
   IMMEDIATE: PRESS,<number>,<leverId>,<waterCommanded>,<pressDetectionMs>
   TRIAL: TRIAL_START,<number>,<startMs>
@@ -29,10 +31,23 @@
     [windowStart,windowEnd). Both levers are counted across the full trial.
     Start and length are drawn independently, uniformly in integer ms.
     There is only the trial-onset buzzer; no extra cue at window onset.
+  OMISSION: INTERVAL_START,<number>,<startMs>
+    Selected-lever press before the deadline:
+      LEVER_PRESS,<number>,<leverId>,<pressDetectionMs>
+      INTERVAL_RESET,<number>
+      INTERVAL_END,<number>,RESET,<totalPressCount>
+    No selected-lever press for the full interval:
+      REWARD,<number>
+      INTERVAL_END,<number>,REWARD,<totalPressCount>
+    STOP during an interval:
+      INTERVAL_END,<number>,ABORT,<totalPressCount>
+    OMISSION intervals restart automatically after the configured reset or
+    reward pause; MATLAB does not send CONTINUE in this mode. Both levers are
+    counted, but only SET_ACTIVE-selected lever presses reset the interval.
   Water=1 means valve commanded on, NOT measured flow.
 
-  A completed trial earns ONE reward if activeCount > 0.
-  The pause starts after reward completion, or after an unrewarded trial.
+  In TRIAL/WINDOW modes, a completed trial earns ONE reward if activeCount > 0.
+  Their pause starts after reward completion, or after an unrewarded trial;
   MATLAB sends CONTINUE to enable the next trial.
   STOP aborts incomplete trials without reward. Pending immediate presses
   are logged with water=0 on STOP. Held levers do not repeat.
@@ -47,8 +62,15 @@ const unsigned long debounceMs = 10;
 const unsigned long solenoidMs = 220;
 const unsigned long valveClosedGapMs = 50;
 
-enum TaskMode { IMMEDIATE, TRIAL, WINDOW };
-enum TrialState { NO_TRIAL, TRIAL_RUNNING, WAIT_REWARD, TRIAL_GAP };
+enum TaskMode { IMMEDIATE, TRIAL, WINDOW, OMISSION };
+enum TrialState {
+  NO_TRIAL,
+  TRIAL_RUNNING,
+  WAIT_REWARD,
+  TRIAL_GAP,
+  OMISSION_RESET_GAP,
+  OMISSION_REWARD_GAP
+};
 enum LeverState { RELEASED, PRESSED, INVALID };
 
 struct Lever {
@@ -84,6 +106,12 @@ unsigned long windowStartOffsetMs = 0, windowEndOffsetMs = 0;
 unsigned long earlyL1 = 0, earlyL2 = 0, windowL1 = 0, windowL2 = 0;
 unsigned long lateL1 = 0, lateL2 = 0;
 bool windowConfigured = false;
+unsigned long omissionIntervalMs = 20000;
+unsigned long omissionResetDelayMs = 1000;
+unsigned long omissionRewardPauseMs = 1000;
+unsigned long omissionBuzzerMs = 500;
+unsigned long omissionBuzzerHz = 4000;
+bool omissionConfigured = false;
 
 // xorshift32 has a nonzero state and generates 1..UINT32_MAX.
 // Rejection sampling avoids modulo bias for integer-millisecond ranges.
@@ -166,7 +194,14 @@ void requestStop() {
   sessionActive = false;
   noTone(buzzerPin);
   if (trialState == TRIAL_RUNNING) {
-    printTrialResult(false, false, millis());
+    if (taskMode == OMISSION) {
+      Serial.print(F("INTERVAL_END,"));
+      Serial.print(trialNumber);
+      Serial.print(F(",ABORT,"));
+      Serial.println(trialLever1 + trialLever2);
+    } else {
+      printTrialResult(false, false, millis());
+    }
   }
   trialState = NO_TRIAL;
   continueRequested = false;
@@ -186,8 +221,11 @@ void beginTrial(unsigned long nowMs) {
   trialStartedAt = nowMs;
   trialState = TRIAL_RUNNING;
   continueRequested = false;
-  if (buzzerMs > 0) tone(buzzerPin, (unsigned int)buzzerHz, buzzerMs);
-  Serial.print(taskMode == WINDOW ? F("WINDOW_START,") : F("TRIAL_START,"));
+  unsigned long cueMs = taskMode == OMISSION ? omissionBuzzerMs : buzzerMs;
+  unsigned long cueHz = taskMode == OMISSION ? omissionBuzzerHz : buzzerHz;
+  if (cueMs > 0) tone(buzzerPin, (unsigned int)cueHz, cueMs);
+  if (taskMode == OMISSION) Serial.print(F("INTERVAL_START,"));
+  else Serial.print(taskMode == WINDOW ? F("WINDOW_START,") : F("TRIAL_START,"));
   Serial.print(trialNumber);
   Serial.print(','); Serial.print(trialStartedAt);
   if (taskMode == WINDOW) {
@@ -199,6 +237,33 @@ void beginTrial(unsigned long nowMs) {
 
 void serviceTrial(unsigned long nowMs) {
   if (!sessionActive || taskMode == IMMEDIATE) return;
+  if (taskMode == OMISSION) {
+    if (trialState == TRIAL_RUNNING &&
+        nowMs - trialStartedAt >= omissionIntervalMs) {
+      noTone(buzzerPin);
+      startWater();
+      trialState = WAIT_REWARD;
+      Serial.print(F("REWARD,"));
+      Serial.println(trialNumber);
+      Serial.print(F("INTERVAL_END,"));
+      Serial.print(trialNumber);
+      Serial.print(F(",REWARD,"));
+      Serial.println(trialLever1 + trialLever2);
+    }
+    if (trialState == WAIT_REWARD && !valveActive) {
+      trialGapStartedAt = nowMs;
+      trialState = OMISSION_REWARD_GAP;
+    }
+    if (trialState == OMISSION_REWARD_GAP &&
+        nowMs - trialGapStartedAt >= omissionRewardPauseMs) {
+      beginTrial(nowMs);
+    }
+    if (trialState == OMISSION_RESET_GAP &&
+        nowMs - trialGapStartedAt >= omissionResetDelayMs) {
+      beginTrial(nowMs);
+    }
+    return;
+  }
   if (trialState == TRIAL_RUNNING && nowMs - trialStartedAt >= trialWindowMs) {
     noTone(buzzerPin);
     bool water = trialActivePresses > 0;
@@ -218,9 +283,27 @@ void serviceTrial(unsigned long nowMs) {
 
 void handlePress(byte id, unsigned long nowMs) {
   if (!sessionActive) return;
-  if (taskMode == TRIAL || taskMode == WINDOW) {
+  if (taskMode == TRIAL || taskMode == WINDOW || taskMode == OMISSION) {
     if (trialState != TRIAL_RUNNING) return;
     if (id == 1) trialLever1++; else trialLever2++;
+    if (taskMode == OMISSION) {
+      if (!isActiveLever(id)) return;
+      trialActivePresses++;
+      noTone(buzzerPin);
+      Serial.print(F("LEVER_PRESS,"));
+      Serial.print(trialNumber);
+      Serial.print(','); Serial.print(id);
+      Serial.print(','); Serial.println(nowMs);
+      Serial.print(F("INTERVAL_RESET,"));
+      Serial.println(trialNumber);
+      Serial.print(F("INTERVAL_END,"));
+      Serial.print(trialNumber);
+      Serial.print(F(",RESET,"));
+      Serial.println(trialLever1 + trialLever2);
+      trialGapStartedAt = nowMs;
+      trialState = OMISSION_RESET_GAP;
+      return;
+    }
     bool inWindow = true;
     if (taskMode == WINDOW) {
       unsigned long elapsed = nowMs - trialStartedAt;
@@ -319,6 +402,24 @@ bool parseWindowSettings(const char *text, unsigned long values[5]) {
          values[3] <= trialWindowMs - values[1] && values[4] >= 1;
 }
 
+bool parseOmissionSettings(const char *text, unsigned long values[5]) {
+  for (byte i = 0; i < 5; i++) {
+    if (*text < '0' || *text > '9') return false;
+    unsigned long n = 0;
+    while (*text >= '0' && *text <= '9') {
+      unsigned long digit = *text++ - '0';
+      if (n > (3600000UL - digit) / 10UL) return false;
+      n = n * 10UL + digit;
+    }
+    values[i] = n;
+    if (i < 4) { if (*text++ != ',') return false; }
+    else if (*text != '\0') return false;
+  }
+  return values[0] >= 1 && values[1] <= 3600000UL &&
+         values[2] <= 3600000UL && values[3] <= values[0] &&
+         values[4] >= 31 && values[4] <= 20000;
+}
+
 void handleCommand() {
   commandBuffer[commandLength] = '\0';
   if (strncmp(commandBuffer, "SET_", 4) == 0 && (sessionActive || stopPending)) {
@@ -330,6 +431,7 @@ void handleCommand() {
     if (strcmp(value, "IMMEDIATE") == 0) taskMode = IMMEDIATE;
     else if (strcmp(value, "TRIAL") == 0) taskMode = TRIAL;
     else if (strcmp(value, "WINDOW") == 0) taskMode = WINDOW;
+    else if (strcmp(value, "OMISSION") == 0) taskMode = OMISSION;
     else { Serial.println(F("ERROR,INVALID_TASK")); return; }
     Serial.print(F("ACK_TASK,")); Serial.println(value);
   } else if (strncmp(commandBuffer, "SET_ACTIVE,", 11) == 0) {
@@ -366,10 +468,29 @@ void handleCommand() {
       Serial.print(values[i]);
       if (i < 4) Serial.print(','); else Serial.println();
     }
+  } else if (strncmp(commandBuffer, "SET_OMISSION,", 13) == 0) {
+    unsigned long values[5];
+    if (!parseOmissionSettings(commandBuffer + 13, values)) {
+      Serial.println(F("ERROR,INVALID_OMISSION_SETTINGS")); return;
+    }
+    omissionIntervalMs = values[0];
+    omissionResetDelayMs = values[1];
+    omissionRewardPauseMs = values[2];
+    omissionBuzzerMs = values[3];
+    omissionBuzzerHz = values[4];
+    omissionConfigured = true;
+    Serial.print(F("ACK_OMISSION,"));
+    for (byte i = 0; i < 5; i++) {
+      Serial.print(values[i]);
+      if (i < 4) Serial.print(','); else Serial.println();
+    }
   } else if (strcmp(commandBuffer, "START") == 0) {
     if (stopPending) { Serial.println(F("ERROR,STOP_IN_PROGRESS")); return; }
     if (taskMode == WINDOW && !windowConfigured) {
       Serial.println(F("ERROR,CONFIGURE_WINDOW_BEFORE_START")); return;
+    }
+    if (taskMode == OMISSION && !omissionConfigured) {
+      Serial.println(F("ERROR,CONFIGURE_OMISSION_BEFORE_START")); return;
     }
     bool newSession = !sessionActive;
     if (newSession) {
@@ -384,7 +505,7 @@ void handleCommand() {
     Serial.println(F("ACK_START"));
     if (newSession && taskMode != IMMEDIATE) beginTrial(millis());
   } else if (strcmp(commandBuffer, "CONTINUE") == 0) {
-    if (sessionActive && taskMode != IMMEDIATE &&
+    if (sessionActive && (taskMode == TRIAL || taskMode == WINDOW) &&
         (trialState == WAIT_REWARD || trialState == TRIAL_GAP)) {
       continueRequested = true;
       Serial.print(F("ACK_CONTINUE,")); Serial.println(trialNumber);
