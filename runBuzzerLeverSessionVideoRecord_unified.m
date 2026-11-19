@@ -2,7 +2,7 @@
 % ver
 %% runBuzzerLeverSessionVideoRecord_unified.m
 %
-% Controls leverTaskController.ino in TRIAL mode.
+% Controls leverTaskControllerWindow.in in TRIAL mode.
 % Run sections in order; run MAIN LOOP promptly after START SESSION.
 % Each completed window earns ONE reward if the active lever was pressed.
 % Both levers are counted. Intertrial presses are not counted or rewarded.
@@ -117,7 +117,7 @@ expectedAcks = ["ACK_TASK,TRIAL", "ACK_ACTIVE," + activeLevers, "ACK_TRIAL," + t
 for configIndex = 1:numel(commands)
     writeline(s, commands(configIndex));
     if ~waitForLine(s, expectedAcks(configIndex), ackTimeout)
-        error("Configuration not confirmed. Upload leverTaskController.ino and rerun CONNECT.");
+        error("Configuration not confirmed. Upload leverTaskControllerWindow.ino and rerun CONNECT.");
     end
 end
 sessionTaskMode = "TRIAL";

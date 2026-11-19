@@ -2,7 +2,7 @@
 % ver
 %% deliverWaterImmediatelyAfterEveryPress_selectLevers.m
 %
-% Controls leverTaskController.ino in IMMEDIATE mode over serial.
+% Controls leverTaskControllerWindow.ino in IMMEDIATE mode over serial.
 % Run sections in order. CONNECT leaves rewards disabled; START SESSION
 % enables rewards. Run MAIN LOOP promptly after START SESSION.
 %

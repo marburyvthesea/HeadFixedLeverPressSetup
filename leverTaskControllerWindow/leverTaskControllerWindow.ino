@@ -59,7 +59,7 @@
 const byte buzzerPin = 5;
 const byte solenoidPin = 7;
 const unsigned long debounceMs = 10;
-const unsigned long solenoidMs = 220;
+const unsigned long solenoidMs = 3500;
 const unsigned long valveClosedGapMs = 50;
 
 enum TaskMode { IMMEDIATE, TRIAL, WINDOW, OMISSION };
