@@ -39,6 +39,7 @@ baudRate        = 115200;   % must match Serial.begin() in the sketch
 sessionMinutes  = 30;       % total session duration (minutes)
 readyTimeout    = 10;       % seconds to wait for "READY" after connecting
 ackTimeout      = 5;        % seconds to wait for ACKs
+serialStallGraceSeconds = 10; % Extra time beyond expected trial/pause before STOP+save
 saveResults     = true;
 outFileBase     = "m5650_FI_15";
 activeLevers    = "LEVER2"; % "BOTH", "LEVER1", or "LEVER2"
@@ -56,7 +57,7 @@ if exist('s','var')
     clear s
 end
 
-s = serialport(portName, baudRate);
+s = serialport(portName, baudRate, 'Timeout', ackTimeout);
 configureTerminator(s, "LF");
 pause(2);      % let the bootloader / setup()'s delay(1000) finish
 flush(s);
@@ -67,6 +68,7 @@ maxRetries = 10;
 connected = false;
 for attempt = 1:maxRetries
     flush(s);
+    readAvailableSerialLine(s,true);
     writeline(s, "STOP");
     if waitForLine(s, "ACK_STOP", 1.5)   % short timeout per attempt
         connected = true;
@@ -108,6 +110,7 @@ activeLevers = upper(strtrim(string(activeLevers)));
 if ~isscalar(activeLevers) || ~ismember(activeLevers, ["BOTH","LEVER1","LEVER2"])
     error('activeLevers must be "BOTH", "LEVER1", or "LEVER2".');
 end
+validateattributes(serialStallGraceSeconds, {'numeric'}, {'scalar','finite','positive'});
 validateattributes(trialSeconds, {'numeric'}, {'scalar','finite','>=',0.001,'<=',3600});
 validateattributes(interTrialSeconds, {'numeric'}, {'scalar','finite','>=',0,'<=',3600});
 validateattributes(buzzerSeconds, {'numeric'}, {'scalar','finite','>=',0,'<=',trialSeconds});
@@ -143,6 +146,7 @@ start(vid);              % begins acquiring & writing to disk in background
 disp('Video recording started.');
 
 
+readAvailableSerialLine(s,true);
 writeline(s, "START");
 if ~waitForLine(s, "ACK_START", ackTimeout)
     writeline(s, "STOP");
@@ -184,129 +188,171 @@ stopRequested = false;
 stopAcknowledged = false;
 stopTimer = [];
 currentTrialStartTime = NaT;
+trialProgressClock = [];
+nextTrialClock = tic; % Waiting for first *_START; ACK_START was already read.
+uiClock = tic;
+serialDiagnostics = struct('StallDetected',false,'TransportError',"", ...
+    'StallReason',"",'MessageAtStall',"",'TransportAtStall',struct(), ...
+    'LastMessage',"ACK_START",'LastTransport',struct());
+stopReason = "";
 
 % ===================== MAIN LOOP =====================
-while running
-    if ~stopRequested && datetime('now') >= sessionEnd
-        fprintf("Session time budget reached. Sending STOP.\n");
-        writeline(s, "STOP");
-        stopRequested = true;
-        stopTimer = tic;
+try
+    while running
+        if toc(uiClock)>=0.05
+            drawnow limitrate;
+            uiClock = tic;
+        end
+        if ~stopRequested && datetime('now') >= sessionEnd
+            stopReason = "Session time limit";
+            fprintf("Session time budget reached. Sending STOP.\n");
+            writeline(s, "STOP");
+            stopRequested = true;
+            stopTimer = tic;
+        end
+        if stopRequested && toc(stopTimer) >= ackTimeout
+            warning("STOP acknowledgment timed out; saving received trial records.");
+            break;
+        end
+        [line,transport] = readAvailableSerialLine(s);
+        serialDiagnostics.LastTransport = transport;
+        if line ~= ""
+            serialDiagnostics.LastMessage = line;
+            tokens = strsplit(line, ",");
+
+            switch tokens{1}
+                case "PRESS_EVENT"
+                    try
+                        [eventData,eventPhase] = parsePressEvent(line,sessionTaskMode,sessionActiveLevers);
+                        pressEventData(end+1,:) = eventData;
+                        pressEventPhase(end+1,1) = eventPhase;
+                        pressEventHostTime(end+1,1) = datetime('now');
+                    catch eventError
+                        pressEventMessagesValid = false;
+                        warning("Invalid press event: %s (%s)",char(line),eventError.message);
+                        if ~stopRequested
+                            writeline(s,"STOP"); stopRequested = true; stopTimer = tic;
+                        end
+                    end
+
+                case "TRIAL_START"
+                    if numel(tokens)~=3 || any(~isfinite(str2double(tokens(2:3)))) || ...
+                            any(str2double(tokens(2:3))<0) || ...
+                            any(str2double(tokens(2:3))~=fix(str2double(tokens(2:3)))) || ...
+                            str2double(tokens{2})<1 || str2double(tokens{3})>=2^32
+                        pressEventMessagesValid = false;
+                        warning("Malformed trial-start record: %s",char(line));
+                        if ~stopRequested
+                            writeline(s,"STOP"); stopRequested = true; stopTimer = tic;
+                        end
+                        continue;
+                    end
+                    if isnan(firstTrialArduinoMs)
+                        firstTrialArduinoMs = str2double(tokens{3});
+                    end
+                    trialProgressClock = tic; nextTrialClock = [];
+                    currentTrialStartTime = datetime('now');
+                    fprintf("[%s] Trial %s started.\n", ...
+                        datestr(currentTrialStartTime,'HH:MM:SS'), tokens{2});
+
+                case {"TRIAL_END", "TRIAL_ABORT"}
+                    if numel(tokens) ~= 10
+                        pressEventMessagesValid = false;
+                        warning("Malformed trial record: %s", char(line));
+                        if ~stopRequested
+                            writeline(s, "STOP");
+                            stopRequested = true;
+                            stopTimer = tic;
+                        end
+                        continue;
+                    end
+                    trialProgressClock = [];
+                    tNum = str2double(tokens{2});
+                    nPress = str2double(tokens{3});
+                    saw = str2double(tokens{4}); % At least one ACTIVE-lever press
+                    water = str2double(tokens{5});
+                    completed = string(tokens{1}) == "TRIAL_END";
+                    tEnd = datetime('now');
+
+                    trialNum(end+1,1) = tNum;
+                    pressCount(end+1,1) = nPress;
+                    sawPress(end+1,1) = saw;
+                    waterDelivered(end+1,1) = water;
+                    lever1Presses(end+1,1) = str2double(tokens{6});
+                    lever2Presses(end+1,1) = str2double(tokens{7});
+                    activePresses(end+1,1) = str2double(tokens{8});
+                    trialStartArduinoMs(end+1,1) = str2double(tokens{9});
+                    trialEndArduinoMs(end+1,1) = str2double(tokens{10});
+                    trialCompleted(end+1,1) = completed;
+                    trialStartWallClock(end+1,1) = currentTrialStartTime;
+                    trialEndWallClock(end+1,1) = tEnd;
+
+                    fprintf("Trial %d: lever1=%d, lever2=%d, active=%d, water=%d, completed=%d.\n", ...
+                        tNum, lever1Presses(end), lever2Presses(end), activePresses(end), water, completed);
+                    currentTrialStartTime = NaT;
+
+                    if completed && ~stopRequested
+                        if datetime('now') >= sessionEnd
+                            writeline(s, "STOP");
+                            stopRequested = true;
+                            stopTimer = tic;
+                        else
+                            writeline(s, "CONTINUE");
+                            nextTrialClock = tic;
+                            % Read ACK/events here in MAIN LOOP, so no records are discarded.
+                        end
+                    end
+
+                case "ACK_CONTINUE"
+                    % Arduino starts the next trial after reward and configured pause.
+
+                case "ACK_STOP"
+                    stopAcknowledged = true;
+                    running = false;
+
+                case {"ERROR", "READY"}
+                    serialDiagnostics.TransportError = line;
+                    pressEventMessagesValid = false;
+                    stopReason = "Arduino error/reset: " + line;
+                    warning("Arduino error/reset: %s", char(line));
+                    if ~stopRequested
+                        writeline(s, "STOP");
+                        stopRequested = true;
+                        stopTimer = tic;
+                    end
+
+                otherwise
+                    fprintf("[Arduino] %s\n", line);
+            end
+        end
+        % Process any complete record above before checking progress deadlines.
+        % A long press-free trial is normal. Only declare a stall AFTER the
+        % expected trial end or expected next onset plus the configured grace.
+        lateEnd = ~isempty(trialProgressClock) && ...
+            toc(trialProgressClock)>sessionTrialSeconds+serialStallGraceSeconds;
+        lateStart = ~isempty(nextTrialClock) && ...
+            toc(nextTrialClock)>sessionInterTrialSeconds+0.350+serialStallGraceSeconds;
+        if running && ~stopRequested && ~transport.HasCompleteLine && (lateEnd || lateStart)
+            serialDiagnostics.StallDetected = true;
+            if lateEnd, reason = "Trial-end record overdue";
+            else, reason = "Next trial-start record overdue"; end
+            serialDiagnostics.StallReason = reason;
+            serialDiagnostics.MessageAtStall = serialDiagnostics.LastMessage;
+            serialDiagnostics.TransportAtStall = transport;
+            stopReason = reason;
+            warning('LeverTask:SerialStall', ...
+                '%s. Last message: %s; %.1f s since bytes; buffered=%d. Sending STOP and saving.', ...
+                reason,serialDiagnostics.LastMessage,transport.SecondsSinceByte,transport.BufferedBytes);
+            writeline(s,"STOP"); stopRequested = true; stopTimer = tic;
+        end
+        if line=="", pause(0.005); end
     end
-    if stopRequested && toc(stopTimer) >= ackTimeout
-        warning("STOP acknowledgment timed out; saving received trial records.");
-        break;
-    end
-    if s.NumBytesAvailable == 0
-        pause(0.02);
-        continue;
-    end
-
-    line = strtrim(readline(s));
-    if line == ""
-        continue;
-    end
-    tokens = strsplit(line, ",");
-
-    switch tokens{1}
-        case "PRESS_EVENT"
-            try
-                [eventData,eventPhase] = parsePressEvent(line,sessionTaskMode,sessionActiveLevers);
-                pressEventData(end+1,:) = eventData;
-                pressEventPhase(end+1,1) = eventPhase;
-                pressEventHostTime(end+1,1) = datetime('now');
-            catch eventError
-                pressEventMessagesValid = false;
-                warning("Invalid press event: %s (%s)",char(line),eventError.message);
-                if ~stopRequested
-                    writeline(s,"STOP"); stopRequested = true; stopTimer = tic;
-                end
-            end
-
-        case "TRIAL_START"
-            if numel(tokens)~=3 || any(~isfinite(str2double(tokens(2:3)))) || ...
-                    any(str2double(tokens(2:3))<0) || ...
-                    any(str2double(tokens(2:3))~=fix(str2double(tokens(2:3)))) || ...
-                    str2double(tokens{2})<1 || str2double(tokens{3})>=2^32
-                pressEventMessagesValid = false;
-                warning("Malformed trial-start record: %s",char(line));
-                if ~stopRequested
-                    writeline(s,"STOP"); stopRequested = true; stopTimer = tic;
-                end
-                continue;
-            end
-            if isnan(firstTrialArduinoMs)
-                firstTrialArduinoMs = str2double(tokens{3});
-            end
-            currentTrialStartTime = datetime('now');
-            fprintf("[%s] Trial %s started.\n", ...
-                datestr(currentTrialStartTime,'HH:MM:SS'), tokens{2});
-
-        case {"TRIAL_END", "TRIAL_ABORT"}
-            if numel(tokens) ~= 10
-                pressEventMessagesValid = false;
-                warning("Malformed trial record: %s", char(line));
-                if ~stopRequested
-                    writeline(s, "STOP");
-                    stopRequested = true;
-                    stopTimer = tic;
-                end
-                continue;
-            end
-            tNum = str2double(tokens{2});
-            nPress = str2double(tokens{3});
-            saw = str2double(tokens{4}); % At least one ACTIVE-lever press
-            water = str2double(tokens{5});
-            completed = string(tokens{1}) == "TRIAL_END";
-            tEnd = datetime('now');
-
-            trialNum(end+1,1) = tNum;
-            pressCount(end+1,1) = nPress;
-            sawPress(end+1,1) = saw;
-            waterDelivered(end+1,1) = water;
-            lever1Presses(end+1,1) = str2double(tokens{6});
-            lever2Presses(end+1,1) = str2double(tokens{7});
-            activePresses(end+1,1) = str2double(tokens{8});
-            trialStartArduinoMs(end+1,1) = str2double(tokens{9});
-            trialEndArduinoMs(end+1,1) = str2double(tokens{10});
-            trialCompleted(end+1,1) = completed;
-            trialStartWallClock(end+1,1) = currentTrialStartTime;
-            trialEndWallClock(end+1,1) = tEnd;
-
-            fprintf("Trial %d: lever1=%d, lever2=%d, active=%d, water=%d, completed=%d.\n", ...
-                tNum, lever1Presses(end), lever2Presses(end), activePresses(end), water, completed);
-            currentTrialStartTime = NaT;
-
-            if completed && ~stopRequested
-                if datetime('now') >= sessionEnd
-                    writeline(s, "STOP");
-                    stopRequested = true;
-                    stopTimer = tic;
-                else
-                    writeline(s, "CONTINUE");
-                    % Read ACK/events here in MAIN LOOP, so no records are discarded.
-                end
-            end
-
-        case "ACK_CONTINUE"
-            % Arduino starts the next trial after reward and configured pause.
-
-        case "ACK_STOP"
-            stopAcknowledged = true;
-            running = false;
-
-        case {"ERROR", "READY"}
-            pressEventMessagesValid = false;
-            warning("Arduino error/reset: %s", char(line));
-            if ~stopRequested
-                writeline(s, "STOP");
-                stopRequested = true;
-                stopTimer = tic;
-            end
-
-        otherwise
-            fprintf("[Arduino] %s\n", line);
-    end
+catch transportError
+    serialDiagnostics.TransportError = string(transportError.message);
+    stopReason = "Serial/session error: " + serialDiagnostics.TransportError;
+    pressEventMessagesValid = false;
+    warning('LeverTask:TransportError','%s. Saving received data.',transportError.message);
+    try writeline(s,"STOP"); catch, end
 end
 actualSessionEnd = datetime('now');
 actualMinutes = seconds(actualSessionEnd - sessionStart) / 60;
@@ -350,10 +396,10 @@ if saveResults
     sessionOutputBase = string(fullfile(newDirectory, sprintf('%s_%s', outFileBase, timestamp)));
     csvName = sessionOutputBase + ".csv";
     matName = sessionOutputBase + ".mat";
-    save(matName, 'results', 'pressEvents', 'pressEventInfo', 'sessionStart', 'sessionEnd', 'sessionMinutes', ...
+    save(matName, 'results', 'pressEvents', 'pressEventInfo', 'serialDiagnostics', 'serialStallGraceSeconds', 'sessionStart', 'sessionEnd', 'sessionMinutes', ...
         'actualSessionEnd', 'actualMinutes', 'stopAcknowledged', 'sessionTaskMode', ...
         'sessionActiveLevers', 'sessionTrialSeconds', 'sessionInterTrialSeconds', ...
-        'sessionBuzzerSeconds', 'sessionBuzzerFrequencyHz');
+        'sessionBuzzerSeconds', 'sessionBuzzerFrequencyHz', 'stopReason');
     writetable(results, csvName);
     writetable(pressEvents,sessionOutputBase + "_presses.csv");
     txtName = sessionOutputBase + ".txt";
@@ -378,6 +424,8 @@ if saveResults
     fprintf(fid, "Completed trials: %d\nAborted trials: %d\n", sum(trialCompleted), sum(~trialCompleted));
     fprintf(fid, "Lever 1 presses: %d\nLever 2 presses: %d\nActive presses: %d\n", ...
         sum(lever1Presses), sum(lever2Presses), sum(activePresses));
+    fprintf(fid, "Serial stall detected: %d\nTransport error: %s\nLast serial message: %s\n", ...
+        serialDiagnostics.StallDetected,serialDiagnostics.TransportError,serialDiagnostics.LastMessage);
     fprintf(fid, "Reward commands: %d\nSTOP acknowledged: %d\n", sum(waterDelivered), stopAcknowledged);
     fclose(fid);
     fprintf("Session data and metadata saved in %s\n", newDirectory);
@@ -398,8 +446,8 @@ function found = waitForLine(s, expectedPrefix, timeoutSec)
     found = false;
     t0 = tic;
     while toc(t0) < timeoutSec
-        if s.NumBytesAvailable > 0
-            line = strtrim(readline(s));
+        line = readAvailableSerialLine(s);
+        if line ~= ""
             if line == expectedPrefix
                 found = true;
                 return;
@@ -475,4 +523,33 @@ function [events,info] = makePressEventTable(data,phase,hostTime,firstMs, ...
         warning('PressTiming:IncompleteLog', ...
             'Press-event verification incomplete. Inspect pressEventInfo and the trial summaries.');
     end
+end
+
+function [line,diagnostics] = readAvailableSerialLine(s,reset)
+% Never wait for a terminator. Retain fragments and any complete queued lines.
+% This function is shared by setup handshakes and the session loop, so bytes
+% received behind ACK_START remain available even when the device buffer is empty.
+    persistent rx byteCount lineCount lastByteClock lastLineClock highWater
+    if nargin<2, reset = false; end
+    if reset || isempty(byteCount)
+        rx = ''; byteCount = 0; lineCount = 0; highWater = 0;
+        lastByteClock = tic; lastLineClock = tic;
+    end
+    line = "";
+    available = s.NumBytesAvailable;
+    if available>0
+        bytes = read(s,available,'uint8');
+        rx = [rx char(bytes(:)')];
+        byteCount = byteCount + numel(bytes); lastByteClock = tic;
+    end
+    highWater = max(highWater,numel(rx));
+    assert(numel(rx)<=1048576,'Serial receive backlog exceeds 1 MiB.');
+    pos = find(rx==char(10),1);
+    if ~isempty(pos)
+        line = string(strtrim(rx(1:pos-1))); rx = rx(pos+1:end);
+        lineCount = lineCount + 1; lastLineClock = tic;
+    end
+    diagnostics = struct('BytesReceived',byteCount,'LinesReceived',lineCount, ...
+        'BufferedBytes',numel(rx),'MaxBufferedBytes',highWater,'HasCompleteLine',any(rx==char(10)), ...
+        'SecondsSinceByte',toc(lastByteClock),'SecondsSinceLine',toc(lastLineClock));
 end

@@ -57,6 +57,14 @@
     OMISSION intervals restart automatically after the configured reset or
     reward pause; MATLAB does not send CONTINUE in this mode. Both levers are
     counted, but only SET_ACTIVE-selected lever presses reset the interval.
+  Transport: complete lines enter a 4096-byte FIFO (512 bytes reserved for
+  stop/error records), then drain in bounded chunks only when USB TX has room.
+  This keeps control, pulse closure and STOP handling running if MATLAB stalls.
+  Finite overflow stops the session and eventually sends:
+    ERROR,TX_OVERFLOW,<droppedProtocolLines>,SESSION_STOPPED
+  Previously queued lines stay ordered; no partial record is silently dropped.
+  Zero lost lines can indicate stopped immediate-mode backpressure before loss.
+  New commands are ignored during fault recovery until ERROR/ACK_STOP drain.
   Water=1 means valve commanded on, NOT measured flow.
 
   In TRIAL/WINDOW modes, a completed trial earns ONE reward if activeCount > 0.
@@ -68,6 +76,7 @@
 #include <Arduino.h>
 #include <string.h>
 #include <stdint.h>
+#include <limits.h>
 
 const byte buzzerPin = 5;
 const byte solenoidPin = 7;
@@ -150,6 +159,78 @@ char commandBuffer[80];
 byte commandLength = 0;
 bool commandOverflow = false;
 
+// Each protocol line is staged before entering the FIFO, so overflow can never
+// leave half a record interleaved with the next one. SerialUSB::write on the
+// UNO R4 can wait indefinitely when its TX FIFO is full; only serviceTx below
+// may call it, and only for the capacity reported by availableForWrite().
+class ProtocolOutput : public Print {
+ public:
+  static const uint16_t capacity = 4096;
+  static const uint16_t stopReserve = 512;
+  static const uint16_t maxLine = 256;
+  bool emergency = false;
+  bool faultPending = false;
+  unsigned long droppedLines = 0;
+
+  size_t write(uint8_t value) override {
+    if (lineLength < maxLine) line[lineLength++] = value;
+    else lineTooLong = true;
+    if (value == '\n') {
+      uint16_t limit = emergency ? capacity : capacity - stopReserve;
+      if (lineTooLong || lineLength > limit || used > limit - lineLength) {
+        noteOverflow(true);
+      } else {
+        for (uint16_t i = 0; i < lineLength; i++) {
+          bytes[tail] = line[i];
+          tail = (tail + 1) % capacity;
+        }
+        used += lineLength;
+      }
+      lineLength = 0;
+      lineTooLong = false;
+    }
+    return 1; // Formatting never waits for the transport or retries a dropped line.
+  }
+  using Print::write;
+
+  bool roomFor(uint16_t length, bool reserved = false) const {
+    uint16_t limit = reserved ? capacity : capacity - stopReserve;
+    return length <= limit && used <= limit - length;
+  }
+  void noteOverflow(bool lostLine) {
+    faultPending = true;
+    if (lostLine && droppedLines != ULONG_MAX) droppedLines++;
+  }
+  uint16_t queuedBytes() const { return used; }
+  void service() {
+    if (used == 0) return;
+    int available = Serial.availableForWrite();
+    if (available <= 0) return;
+    uint16_t count = used;
+    if (count > 64) count = 64; // Bound transport work per control-loop iteration.
+    if (count > capacity - head) count = capacity - head;
+    if (count > (unsigned int)available) count = (uint16_t)available;
+    size_t written = Serial.write(bytes + head, count);
+    if (written > count) written = count;
+    head = (head + written) % capacity;
+    used -= written; // A disconnected/short writer keeps every unsent byte queued.
+  }
+  void reset() {
+    head = tail = used = lineLength = 0;
+    lineTooLong = emergency = faultPending = false;
+    droppedLines = 0;
+  }
+ private:
+  uint8_t bytes[capacity];
+  uint8_t line[maxLine];
+  uint16_t head = 0, tail = 0, used = 0, lineLength = 0;
+  bool lineTooLong = false;
+};
+ProtocolOutput Protocol;
+bool txFaultLatched = false, txOverflowReportPending = false;
+
+void serviceTx() { Protocol.service(); }
+
 bool isActiveLever(byte id) {
   return activeLever == 0 || activeLever == id;
 }
@@ -168,15 +249,15 @@ void printPressEvent(byte id, unsigned long nowMs) {
     qualifying = selected && elapsedMs >= windowStartOffsetMs &&
                  elapsedMs < windowEndOffsetMs;
   }
-  Serial.print(F("PRESS_EVENT,")); Serial.print(inTrial ? trialNumber : 0);
-  Serial.print(','); Serial.print(id);
-  Serial.print(','); Serial.print(nowMs);
-  Serial.print(',');
-  if (inTrial) Serial.print(elapsedMs); else Serial.print(-1);
-  Serial.print(','); Serial.print(inTrial ? 1 : 0);
-  Serial.print(','); Serial.print(selected ? 1 : 0);
-  Serial.print(','); Serial.print(qualifying ? 1 : 0);
-  Serial.print(','); Serial.println(phase);
+  Protocol.print(F("PRESS_EVENT,")); Protocol.print(inTrial ? trialNumber : 0);
+  Protocol.print(','); Protocol.print(id);
+  Protocol.print(','); Protocol.print(nowMs);
+  Protocol.print(',');
+  if (inTrial) Protocol.print(elapsedMs); else Protocol.print(-1);
+  Protocol.print(','); Protocol.print(inTrial ? 1 : 0);
+  Protocol.print(','); Protocol.print(selected ? 1 : 0);
+  Protocol.print(','); Protocol.print(qualifying ? 1 : 0);
+  Protocol.print(','); Protocol.println(phase);
 }
 
 void startWater() {
@@ -197,35 +278,39 @@ void serviceWater(unsigned long nowMs) {
 
 void printTrialResult(bool completed, bool water, unsigned long nowMs) {
   if (taskMode == WINDOW)
-    Serial.print(completed ? F("WINDOW_END,") : F("WINDOW_ABORT,"));
+    Protocol.print(completed ? F("WINDOW_END,") : F("WINDOW_ABORT,"));
   else
-    Serial.print(completed ? F("TRIAL_END,") : F("TRIAL_ABORT,"));
-  Serial.print(trialNumber);
-  Serial.print(','); Serial.print(trialLever1 + trialLever2);
-  Serial.print(','); Serial.print(trialActivePresses > 0 ? 1 : 0);
-  Serial.print(','); Serial.print(water ? 1 : 0);
-  Serial.print(','); Serial.print(trialLever1);
-  Serial.print(','); Serial.print(trialLever2);
-  Serial.print(','); Serial.print(trialActivePresses);
-  Serial.print(','); Serial.print(trialStartedAt);
-  Serial.print(','); Serial.print(nowMs);
+    Protocol.print(completed ? F("TRIAL_END,") : F("TRIAL_ABORT,"));
+  Protocol.print(trialNumber);
+  Protocol.print(','); Protocol.print(trialLever1 + trialLever2);
+  Protocol.print(','); Protocol.print(trialActivePresses > 0 ? 1 : 0);
+  Protocol.print(','); Protocol.print(water ? 1 : 0);
+  Protocol.print(','); Protocol.print(trialLever1);
+  Protocol.print(','); Protocol.print(trialLever2);
+  Protocol.print(','); Protocol.print(trialActivePresses);
+  Protocol.print(','); Protocol.print(trialStartedAt);
+  Protocol.print(','); Protocol.print(nowMs);
   if (taskMode == WINDOW) {
-    Serial.print(','); Serial.print(windowStartOffsetMs);
-    Serial.print(','); Serial.print(windowEndOffsetMs);
-    Serial.print(','); Serial.print(earlyL1);
-    Serial.print(','); Serial.print(earlyL2);
-    Serial.print(','); Serial.print(windowL1);
-    Serial.print(','); Serial.print(windowL2);
-    Serial.print(','); Serial.print(lateL1);
-    Serial.print(','); Serial.print(lateL2);
+    Protocol.print(','); Protocol.print(windowStartOffsetMs);
+    Protocol.print(','); Protocol.print(windowEndOffsetMs);
+    Protocol.print(','); Protocol.print(earlyL1);
+    Protocol.print(','); Protocol.print(earlyL2);
+    Protocol.print(','); Protocol.print(windowL1);
+    Protocol.print(','); Protocol.print(windowL2);
+    Protocol.print(','); Protocol.print(lateL1);
+    Protocol.print(','); Protocol.print(lateL2);
   }
-  Serial.println();
+  Protocol.println();
 }
 
 void finishStopIfReady() {
-  if (stopPending && !valveActive && queueCount == 0) {
+  if (stopPending && !valveActive && queueCount == 0 &&
+      !Protocol.faultPending && !txOverflowReportPending && Protocol.roomFor(16, true)) {
+    bool previous = Protocol.emergency;
+    Protocol.emergency = true;
+    Protocol.println(F("ACK_STOP"));
+    Protocol.emergency = previous;
     stopPending = false;
-    Serial.println(F("ACK_STOP"));
   }
 }
 
@@ -233,20 +318,53 @@ void requestStop() {
   sessionActive = false;
   pressLogEnabled = false;
   noTone(buzzerPin);
+  bool previous = Protocol.emergency;
+  Protocol.emergency = true;
   if (trialState == TRIAL_RUNNING) {
     if (taskMode == OMISSION) {
-      Serial.print(F("INTERVAL_END,"));
-      Serial.print(trialNumber);
-      Serial.print(F(",ABORT,"));
-      Serial.println(trialLever1 + trialLever2);
+      Protocol.print(F("INTERVAL_END,"));
+      Protocol.print(trialNumber);
+      Protocol.print(F(",ABORT,"));
+      Protocol.println(trialLever1 + trialLever2);
     } else {
       printTrialResult(false, false, millis());
     }
   }
+  Protocol.emergency = previous;
   trialState = NO_TRIAL;
   continueRequested = false;
   stopPending = true;
   finishStopIfReady();
+}
+
+void serviceTxFault() {
+  if (Protocol.faultPending) {
+    Protocol.faultPending = false;
+    if (!txFaultLatched) {
+      txFaultLatched = true;
+      txOverflowReportPending = true;
+      // Stop control state immediately; do not shorten an already-started pulse.
+      requestStop();
+    }
+    // requestStop's abort record can itself fail if repeated commands consumed
+    // the reserve; keep the loss count and report it once transport recovers.
+    Protocol.faultPending = false;
+  }
+  if (txOverflowReportPending && Protocol.roomFor(96, true)) {
+    bool previous = Protocol.emergency;
+    Protocol.emergency = true;
+    Protocol.print(F("ERROR,TX_OVERFLOW,"));
+    Protocol.print(Protocol.droppedLines);
+    Protocol.println(F(",SESSION_STOPPED"));
+    Protocol.emergency = previous;
+    txOverflowReportPending = false;
+    finishStopIfReady();
+  }
+  if (txFaultLatched && !txOverflowReportPending && !stopPending &&
+      queueCount == 0 && Protocol.queuedBytes() == 0) {
+    txFaultLatched = false;
+    Protocol.droppedLines = 0;
+  }
 }
 
 void beginTrial(unsigned long nowMs) {
@@ -264,15 +382,15 @@ void beginTrial(unsigned long nowMs) {
   unsigned long cueMs = taskMode == OMISSION ? omissionBuzzerMs : buzzerMs;
   unsigned long cueHz = taskMode == OMISSION ? omissionBuzzerHz : buzzerHz;
   if (cueMs > 0) tone(buzzerPin, (unsigned int)cueHz, cueMs);
-  if (taskMode == OMISSION) Serial.print(F("INTERVAL_START,"));
-  else Serial.print(taskMode == WINDOW ? F("WINDOW_START,") : F("TRIAL_START,"));
-  Serial.print(trialNumber);
-  Serial.print(','); Serial.print(trialStartedAt);
+  if (taskMode == OMISSION) Protocol.print(F("INTERVAL_START,"));
+  else Protocol.print(taskMode == WINDOW ? F("WINDOW_START,") : F("TRIAL_START,"));
+  Protocol.print(trialNumber);
+  Protocol.print(','); Protocol.print(trialStartedAt);
   if (taskMode == WINDOW) {
-    Serial.print(','); Serial.print(windowStartOffsetMs);
-    Serial.print(','); Serial.print(windowEndOffsetMs);
+    Protocol.print(','); Protocol.print(windowStartOffsetMs);
+    Protocol.print(','); Protocol.print(windowEndOffsetMs);
   }
-  Serial.println();
+  Protocol.println();
 }
 
 void serviceTrial(unsigned long nowMs) {
@@ -283,12 +401,12 @@ void serviceTrial(unsigned long nowMs) {
       noTone(buzzerPin);
       startWater();
       trialState = WAIT_REWARD;
-      Serial.print(F("REWARD,"));
-      Serial.println(trialNumber);
-      Serial.print(F("INTERVAL_END,"));
-      Serial.print(trialNumber);
-      Serial.print(F(",REWARD,"));
-      Serial.println(trialLever1 + trialLever2);
+      Protocol.print(F("REWARD,"));
+      Protocol.println(trialNumber);
+      Protocol.print(F("INTERVAL_END,"));
+      Protocol.print(trialNumber);
+      Protocol.print(F(",REWARD,"));
+      Protocol.println(trialLever1 + trialLever2);
     }
     if (trialState == WAIT_REWARD && !valveActive) {
       trialGapStartedAt = nowMs;
@@ -331,16 +449,16 @@ void handlePress(byte id, unsigned long nowMs) {
       if (!isActiveLever(id)) return;
       trialActivePresses++;
       noTone(buzzerPin);
-      Serial.print(F("LEVER_PRESS,"));
-      Serial.print(trialNumber);
-      Serial.print(','); Serial.print(id);
-      Serial.print(','); Serial.println(nowMs);
-      Serial.print(F("INTERVAL_RESET,"));
-      Serial.println(trialNumber);
-      Serial.print(F("INTERVAL_END,"));
-      Serial.print(trialNumber);
-      Serial.print(F(",RESET,"));
-      Serial.println(trialLever1 + trialLever2);
+      Protocol.print(F("LEVER_PRESS,"));
+      Protocol.print(trialNumber);
+      Protocol.print(','); Protocol.print(id);
+      Protocol.print(','); Protocol.println(nowMs);
+      Protocol.print(F("INTERVAL_RESET,"));
+      Protocol.println(trialNumber);
+      Protocol.print(F("INTERVAL_END,"));
+      Protocol.print(trialNumber);
+      Protocol.print(F(",RESET,"));
+      Protocol.println(trialLever1 + trialLever2);
       trialGapStartedAt = nowMs;
       trialState = OMISSION_RESET_GAP;
       return;
@@ -361,7 +479,7 @@ void handlePress(byte id, unsigned long nowMs) {
     return;
   }
   if (queueCount >= queueCapacity) {
-    Serial.println(F("ERROR,PRESS_QUEUE_FULL,SESSION_STOPPED"));
+    Protocol.println(F("ERROR,PRESS_QUEUE_FULL,SESSION_STOPPED"));
     requestStop();
     return;
   }
@@ -394,6 +512,12 @@ void updateLever(Lever &lever, unsigned long nowMs) {
 
 void servicePressQueue(unsigned long nowMs) {
   if (queueCount == 0) return;
+  // Pending immediate presses remain immutable until their full PRESS line fits.
+  // Under backpressure stop earning rewards, then drain canceled records later.
+  if (!Protocol.roomFor(80)) {
+    if (sessionActive) Protocol.noteOverflow(false);
+    return;
+  }
   PressEvent event = pressQueue[queueHead];
   bool water = sessionActive && taskMode == IMMEDIATE && event.eligible;
   if (stopPending && valveActive) return;
@@ -402,10 +526,10 @@ void servicePressQueue(unsigned long nowMs) {
   queueHead = (queueHead + 1) % queueCapacity;
   queueCount--;
   if (water) startWater();
-  Serial.print(F("PRESS,")); Serial.print(event.number);
-  Serial.print(','); Serial.print(event.leverId);
-  Serial.print(','); Serial.print(water ? 1 : 0);
-  Serial.print(','); Serial.println(event.detectedAt);
+  Protocol.print(F("PRESS,")); Protocol.print(event.number);
+  Protocol.print(','); Protocol.print(event.leverId);
+  Protocol.print(','); Protocol.print(water ? 1 : 0);
+  Protocol.print(','); Protocol.println(event.detectedAt);
 }
 
 bool parseTrialSettings(const char *text, unsigned long values[4]) {
@@ -463,62 +587,65 @@ bool parseOmissionSettings(const char *text, unsigned long values[5]) {
 
 void handleCommand() {
   commandBuffer[commandLength] = '\0';
+  // A fault already stops the session and queues ERROR/ACK_STOP. Do not let
+  // retries start/configure a task until those records have drained in order.
+  if (txFaultLatched) return;
   if (strncmp(commandBuffer, "SET_", 4) == 0 && (sessionActive || stopPending)) {
-    Serial.println(F("ERROR,STOP_BEFORE_CONFIGURING"));
+    Protocol.println(F("ERROR,STOP_BEFORE_CONFIGURING"));
     return;
   }
   if (strncmp(commandBuffer, "SET_PRESS_LOG,", 14) == 0) {
     const char *value = commandBuffer + 14;
     if (strcmp(value, "ON") == 0) pressLogEnabled = true;
     else if (strcmp(value, "OFF") == 0) pressLogEnabled = false;
-    else { Serial.println(F("ERROR,INVALID_PRESS_LOG")); return; }
-    Serial.print(F("ACK_PRESS_LOG,")); Serial.println(value);
+    else { Protocol.println(F("ERROR,INVALID_PRESS_LOG")); return; }
+    Protocol.print(F("ACK_PRESS_LOG,")); Protocol.println(value);
   } else if (strncmp(commandBuffer, "SET_TASK,", 9) == 0) {
     const char *value = commandBuffer + 9;
     if (strcmp(value, "IMMEDIATE") == 0) taskMode = IMMEDIATE;
     else if (strcmp(value, "TRIAL") == 0) taskMode = TRIAL;
     else if (strcmp(value, "WINDOW") == 0) taskMode = WINDOW;
     else if (strcmp(value, "OMISSION") == 0) taskMode = OMISSION;
-    else { Serial.println(F("ERROR,INVALID_TASK")); return; }
-    Serial.print(F("ACK_TASK,")); Serial.println(value);
+    else { Protocol.println(F("ERROR,INVALID_TASK")); return; }
+    Protocol.print(F("ACK_TASK,")); Protocol.println(value);
   } else if (strncmp(commandBuffer, "SET_ACTIVE,", 11) == 0) {
     const char *value = commandBuffer + 11;
     if (strcmp(value, "BOTH") == 0) activeLever = 0;
     else if (strcmp(value, "LEVER1") == 0) activeLever = 1;
     else if (strcmp(value, "LEVER2") == 0) activeLever = 2;
-    else { Serial.println(F("ERROR,INVALID_ACTIVE_MODE")); return; }
-    Serial.print(F("ACK_ACTIVE,")); Serial.println(value);
+    else { Protocol.println(F("ERROR,INVALID_ACTIVE_MODE")); return; }
+    Protocol.print(F("ACK_ACTIVE,")); Protocol.println(value);
   } else if (strncmp(commandBuffer, "SET_TRIAL,", 10) == 0) {
     unsigned long values[4];
     if (!parseTrialSettings(commandBuffer + 10, values)) {
-      Serial.println(F("ERROR,INVALID_TRIAL_SETTINGS")); return;
+      Protocol.println(F("ERROR,INVALID_TRIAL_SETTINGS")); return;
     }
     trialWindowMs = values[0]; trialPauseMs = values[1];
     windowConfigured = false; // Revalidate window bounds after any duration change.
     buzzerMs = values[2]; buzzerHz = values[3];
-    Serial.print(F("ACK_TRIAL,"));
+    Protocol.print(F("ACK_TRIAL,"));
     for (byte i = 0; i < 4; i++) {
-      Serial.print(values[i]);
-      if (i < 3) Serial.print(','); else Serial.println();
+      Protocol.print(values[i]);
+      if (i < 3) Protocol.print(','); else Protocol.println();
     }
   } else if (strncmp(commandBuffer, "SET_WINDOW,", 11) == 0) {
     unsigned long values[5];
     if (!parseWindowSettings(commandBuffer + 11, values)) {
-      Serial.println(F("ERROR,INVALID_WINDOW_SETTINGS")); return;
+      Protocol.println(F("ERROR,INVALID_WINDOW_SETTINGS")); return;
     }
     windowStartMinMs = values[0]; windowStartMaxMs = values[1];
     windowLengthMinMs = values[2]; windowLengthMaxMs = values[3];
     windowSeed = values[4];
     windowConfigured = true;
-    Serial.print(F("ACK_WINDOW,"));
+    Protocol.print(F("ACK_WINDOW,"));
     for (byte i = 0; i < 5; i++) {
-      Serial.print(values[i]);
-      if (i < 4) Serial.print(','); else Serial.println();
+      Protocol.print(values[i]);
+      if (i < 4) Protocol.print(','); else Protocol.println();
     }
   } else if (strncmp(commandBuffer, "SET_OMISSION,", 13) == 0) {
     unsigned long values[5];
     if (!parseOmissionSettings(commandBuffer + 13, values)) {
-      Serial.println(F("ERROR,INVALID_OMISSION_SETTINGS")); return;
+      Protocol.println(F("ERROR,INVALID_OMISSION_SETTINGS")); return;
     }
     omissionIntervalMs = values[0];
     omissionResetDelayMs = values[1];
@@ -526,18 +653,18 @@ void handleCommand() {
     omissionBuzzerMs = values[3];
     omissionBuzzerHz = values[4];
     omissionConfigured = true;
-    Serial.print(F("ACK_OMISSION,"));
+    Protocol.print(F("ACK_OMISSION,"));
     for (byte i = 0; i < 5; i++) {
-      Serial.print(values[i]);
-      if (i < 4) Serial.print(','); else Serial.println();
+      Protocol.print(values[i]);
+      if (i < 4) Protocol.print(','); else Protocol.println();
     }
   } else if (strcmp(commandBuffer, "START") == 0) {
-    if (stopPending) { Serial.println(F("ERROR,STOP_IN_PROGRESS")); return; }
+    if (stopPending) { Protocol.println(F("ERROR,STOP_IN_PROGRESS")); return; }
     if (taskMode == WINDOW && !windowConfigured) {
-      Serial.println(F("ERROR,CONFIGURE_WINDOW_BEFORE_START")); return;
+      Protocol.println(F("ERROR,CONFIGURE_WINDOW_BEFORE_START")); return;
     }
     if (taskMode == OMISSION && !omissionConfigured) {
-      Serial.println(F("ERROR,CONFIGURE_OMISSION_BEFORE_START")); return;
+      Protocol.println(F("ERROR,CONFIGURE_OMISSION_BEFORE_START")); return;
     }
     bool newSession = !sessionActive;
     if (newSession) {
@@ -549,17 +676,17 @@ void handleCommand() {
       continueRequested = false;
       sessionActive = true;
     }
-    Serial.println(F("ACK_START"));
+    Protocol.println(F("ACK_START"));
     if (newSession && taskMode != IMMEDIATE) beginTrial(millis());
   } else if (strcmp(commandBuffer, "CONTINUE") == 0) {
     if (sessionActive && (taskMode == TRIAL || taskMode == WINDOW) &&
         (trialState == WAIT_REWARD || trialState == TRIAL_GAP)) {
       continueRequested = true;
-      Serial.print(F("ACK_CONTINUE,")); Serial.println(trialNumber);
-    } else Serial.println(F("ERROR,CONTINUE_NOT_EXPECTED"));
+      Protocol.print(F("ACK_CONTINUE,")); Protocol.println(trialNumber);
+    } else Protocol.println(F("ERROR,CONTINUE_NOT_EXPECTED"));
   } else if (strcmp(commandBuffer, "STOP") == 0) {
     requestStop();
-  } else if (commandLength > 0) Serial.println(F("ERROR,UNKNOWN_COMMAND"));
+  } else if (commandLength > 0) Protocol.println(F("ERROR,UNKNOWN_COMMAND"));
 }
 
 void readCommands() {
@@ -567,7 +694,7 @@ void readCommands() {
   while (Serial.available() > 0 && bytesRead++ < 32) {
     char c = Serial.read();
     if (c == '\n') {
-      if (commandOverflow) Serial.println(F("ERROR,COMMAND_TOO_LONG"));
+      if (commandOverflow) Protocol.println(F("ERROR,COMMAND_TOO_LONG"));
       else handleCommand();
       commandLength = 0; commandOverflow = false;
     } else if (c != '\r') {
@@ -584,18 +711,26 @@ void setup() {
   pinMode(lever1.noPin, INPUT_PULLUP); pinMode(lever1.ncPin, INPUT_PULLUP);
   pinMode(lever2.noPin, INPUT_PULLUP); pinMode(lever2.ncPin, INPUT_PULLUP);
   Serial.begin(115200);
-  Serial.println(F("READY"));
+  Protocol.println(F("READY"));
 }
 
 void loop() {
   serviceWater(millis());
+  serviceTx();
+  serviceTxFault();
   readCommands();
+  serviceTxFault();
   unsigned long nowMs = millis();
   // Close a window BEFORE processing presses at or past its deadline.
   serviceTrial(nowMs);
-  updateLever(lever1, nowMs); updateLever(lever2, nowMs);
+  serviceTxFault();
+  updateLever(lever1, nowMs);
+  serviceTxFault();
+  updateLever(lever2, nowMs);
+  serviceTxFault();
   serviceWater(millis());
   servicePressQueue(millis());
+  serviceTxFault();
   finishStopIfReady();
+  serviceTx();
 }
-

@@ -24,12 +24,20 @@ void resetController() {
   std::fill(std::begin(mockPins),std::end(mockPins),LOW);
   std::fill(std::begin(mockRisingEdges),std::end(mockRisingEdges),0);
   mockPins[lever1.noPin]=mockPins[lever2.noPin]=HIGH; // released: NO open, NC closed
-  Serial.output.clear();
+  Serial.output.clear();Serial.input.clear();Serial.writeCapacity=4096;
+  Serial.writeLimit=std::numeric_limits<size_t>::max();Serial.writeCalls=0;Serial.connected=true;
+  Protocol.reset();txFaultLatched=txOverflowReportPending=false;
+}
+void drainTx() {
+  for (unsigned int i=0;i<4096 && Protocol.queuedBytes();i++) {
+    auto before=Protocol.queuedBytes(); serviceTx();
+    if(Protocol.queuedBytes()==before)break;
+  }
 }
 std::string command(const std::string &value) {
   assert(value.size()<sizeof(commandBuffer));
   std::copy(value.begin(),value.end(),commandBuffer);commandLength=static_cast<byte>(value.size());
-  auto before=Serial.output.size();handleCommand();return Serial.output.substr(before);
+  drainTx();auto before=Serial.output.size();handleCommand();commandLength=0;commandOverflow=false;drainTx();return Serial.output.substr(before);
 }
 void tick(unsigned long now) {mockNow=now;loop();}
 void pressAt(byte id,unsigned long elapsed) {mockNow=trialStartedAt+elapsed;handlePress(id,mockNow);}
@@ -42,6 +50,7 @@ void configure(const std::string &mode,bool logging=true,const std::string &sele
   if(logging)assert(command("SET_PRESS_LOG,ON")=="ACK_PRESS_LOG,ON\n");
 }
 std::vector<std::vector<std::string>> records(const std::string &kind) {
+  drainTx();
   std::vector<std::vector<std::string>> result;std::istringstream lines(Serial.output);std::string line;
   while(std::getline(lines,line)) {
     if(line.rfind(kind+",",0)!=0)continue;
@@ -155,9 +164,125 @@ void testUnsignedClockWrap() {
   pressAt(2,200);event(0,1,2,99,200,true,true,true,"TRIAL");
   tick(trialStartedAt+1000);assert(valveActive && records("TRIAL_END").back()[7]=="1");
 }
+void testBlockedTxKeepsWaterAndStopResponsive() {
+  resetController();configure("TRIAL");command("START");
+  const auto before=Serial.output;
+  Serial.writeCapacity=0;Serial.writeCalls=0;
+  pressAt(2,250);tick(2000);
+  assert(valveActive && mockPins[solenoidPin]==HIGH && Protocol.queuedBytes()>0);
+  // Receive STOP while no output byte can move. Control state still stops now.
+  Serial.input="STOP\n";tick(2100);
+  assert(!sessionActive && stopPending && valveActive && Serial.input.empty());
+  tick(2349);assert(valveActive && mockPins[solenoidPin]==HIGH);
+  tick(2350);assert(!valveActive && mockPins[solenoidPin]==LOW && !stopPending);
+  assert(Serial.output==before && Serial.writeCalls==0); // never tried a blocking write
+  assert(!Protocol.faultPending && !txFaultLatched);
+  // Recovery accepts short writes, preserving the unsent tail and record order.
+  Serial.writeCapacity=3;Serial.writeLimit=2;drainTx();
+  event(0,1,2,1250,250,true,true,true,"TRIAL");
+  assert(records("TRIAL_END").back()[4]=="1");
+  const auto eventPos=Serial.output.find("PRESS_EVENT,");
+  const auto endPos=Serial.output.find("TRIAL_END,");
+  const auto ackPos=Serial.output.find("ACK_STOP\n");
+  assert(eventPos<endPos && endPos<ackPos && Protocol.queuedBytes()==0);
+}
+void testDisconnectedAndPartialWriterRetainsBytes() {
+  resetController();configure("TRIAL");command("START");
+  const auto before=Serial.output;
+  Serial.connected=false; // native core may report FIFO capacity but write zero when disconnected
+  pressAt(2,100);auto pending=Protocol.queuedBytes();
+  serviceTx();assert(Protocol.queuedBytes()==pending && Serial.output==before);
+  tick(2000);assert(valveActive);tick(2350);assert(!valveActive);
+  assert(!Protocol.faultPending && !txFaultLatched);
+  Serial.connected=true;Serial.writeLimit=1;drainTx();
+  event(0,1,2,1100,100,true,true,true,"TRIAL");
+  assert(records("TRIAL_END").size()==1 && Protocol.queuedBytes()==0);
+  // Stage complete lines atomically, then drain a byte at a time across FIFO wraps.
+  resetController();Serial.writeCapacity=5;Serial.writeLimit=1;
+  Protocol.print("ACK_");Protocol.print("TEST");
+  assert(Protocol.queuedBytes()==0 && Serial.output.empty());
+  Protocol.println();drainTx();assert(Serial.output=="ACK_TEST\n");
+  Serial.output.clear();std::string expected;
+  for(unsigned int i=0;i<600;i++) {
+    Protocol.print("TEST,");Protocol.println(i);
+    expected+="TEST,"+std::to_string(i)+"\n";
+    drainTx();
+  }
+  assert(Serial.output==expected && Protocol.queuedBytes()==0);
+}
+void testOverflowIsExplicitAndStopsSession() {
+  resetController();configure("TRIAL");command("START");
+  Serial.output.clear();Serial.writeCapacity=0;Serial.writeCalls=0;
+  for(unsigned int i=0;i<200 && sessionActive;i++) {
+    mockNow++;handlePress(2,mockNow);loop();
+  }
+  assert(!sessionActive && !pressLogEnabled && txFaultLatched);
+  assert(!valveActive && mockPins[solenoidPin]==LOW);
+  assert(Protocol.droppedLines==1 && !txOverflowReportPending);
+  assert(Serial.output.empty() && Serial.writeCalls==0);
+  assert(command("START").empty() && !sessionActive); // cannot restart before fault records drain
+  const auto expectedActive=trialActivePresses;
+  Serial.writeCapacity=7;Serial.writeLimit=3;drainTx();
+  auto events=records("PRESS_EVENT");auto errors=records("ERROR");
+  assert(events.size()+1==expectedActive);
+  for(const auto &line:events) assert(line.size()==9);
+  assert(errors.size()==1 && errors[0].size()==4);
+  assert(errors[0][1]=="TX_OVERFLOW" && errors[0][2]=="1" && errors[0][3]=="SESSION_STOPPED");
+  auto abort=records("TRIAL_ABORT");assert(abort.size()==1 && abort[0][4]=="0");
+  assert(std::stoul(abort[0][7])==expectedActive);
+  assert(Serial.output.find("ERROR,TX_OVERFLOW,")<Serial.output.find("ACK_STOP\n"));
+  assert(Serial.output.rfind("ACK_STOP\n")==Serial.output.size()-9);
+  loop();assert(!txFaultLatched); // recovered transport permits normal connection/configuration again
+  assert(command("SET_TASK,TRIAL")=="ACK_TASK,TRIAL\n");
+}
+void testOverflowDoesNotTruncateActiveReward() {
+  resetController();configure("TRIAL");command("START");
+  Serial.writeCapacity=0;pressAt(2,100);tick(2000);assert(valveActive);
+  for(unsigned int i=0;i<200 && sessionActive;i++) {
+    mockNow++;handlePress(2,mockNow);loop(); // presses during reward are logged as ITI
+  }
+  assert(txFaultLatched && !sessionActive && valveActive);
+  tick(2349);assert(valveActive && mockPins[solenoidPin]==HIGH);
+  tick(2350);assert(!valveActive && mockPins[solenoidPin]==LOW && !stopPending);
+  Serial.writeCapacity=64;drainTx();
+  assert(records("TRIAL_END").size()==1 && records("TRIAL_END")[0][4]=="1");
+  assert(records("ERROR").size()==1 && Serial.output.find("ACK_STOP\n")!=std::string::npos);
+}
+void fillNormalTxWithoutOverflow() {
+  const char *padding="TEST,012345678901234567890123456789012345678901234567890123456789";
+  while(Protocol.roomFor(80)) Protocol.println(padding);
+  assert(!Protocol.roomFor(80) && !Protocol.faultPending);
+}
+void testImmediateBackpressureRetainsCanceledPress() {
+  resetController();configure("IMMEDIATE");command("START");
+  Serial.output.clear();Serial.writeCapacity=0;
+  fillNormalTxWithoutOverflow();mockNow=1100;handlePress(2,mockNow);
+  assert(queueCount==1);servicePressQueue(mockNow);serviceTxFault();
+  assert(txFaultLatched && !sessionActive && stopPending && queueCount==1);
+  assert(!valveActive && Protocol.droppedLines==0);
+  Serial.writeCapacity=17;Serial.writeLimit=5;
+  for(unsigned int i=0;i<4096 && (Protocol.queuedBytes() || stopPending || txFaultLatched);i++)loop();
+  assert(queueCount==0 && !stopPending && !txFaultLatched && !valveActive);
+  auto presses=records("PRESS");assert(presses.size()==1);
+  assert(presses[0][3]=="0" && presses[0][4]=="1100");
+  auto errors=records("ERROR");assert(errors.size()==1 && errors[0][2]=="0");
+  assert(Serial.output.find("PRESS,1,2,0,1100\n")<Serial.output.find("ACK_STOP\n"));
+}
+void testStopUsesReservedCapacity() {
+  resetController();configure("TRIAL");command("START");
+  Serial.output.clear();Serial.writeCapacity=0;fillNormalTxWithoutOverflow();
+  mockNow=1400;command("STOP");
+  assert(!sessionActive && !stopPending && !Protocol.faultPending && !txFaultLatched);
+  Serial.writeCapacity=1;drainTx();
+  assert(records("TRIAL_ABORT").size()==1 && records("ERROR").empty());
+  assert(Serial.output.find("TRIAL_ABORT,")<Serial.output.find("ACK_STOP\n"));
+}
 int main() {
   testOptInAndCompatibility();testTrialEventsAndSummary();testWindowClassification();
   testAbortAndUnrewardedGaps();testDebouncedDetectionAndHeldLever();
   testImmediateAndOmissionUnaffected();testUnsignedClockWrap();
-  std::cout<<"All individual-press timing and unified-task regression checks passed.\n";
+  testBlockedTxKeepsWaterAndStopResponsive();testDisconnectedAndPartialWriterRetainsBytes();
+  testOverflowIsExplicitAndStopsSession();testOverflowDoesNotTruncateActiveReward();
+  testImmediateBackpressureRetainsCanceledPress();testStopUsesReservedCapacity();
+  std::cout<<"All individual-press timing, stalled/partial TX and unified-task regression checks passed.\n";
 }

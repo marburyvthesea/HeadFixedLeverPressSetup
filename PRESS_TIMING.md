@@ -109,6 +109,7 @@ g++ -std=c++17 -Wall -Wextra -Werror -I tests tests/press_event_controller_test.
 Firmware behavior checks passed and the MATLAB data flow was statically reviewed.
 MATLAB and physical board/camera execution were not available here. Run Verify
 in Arduino IDE and a short rig session, then check S.pressEvents and
-S.pressEventInfo before collecting data. Existing manual Ctrl+C or a serial
-exception can bypass the normal MAT-saving section; these scripts do not promise
-crash-proof persistence.
+S.pressEventInfo before collecting data. Main-loop serial errors now attempt STOP and save parsed data, with diagnostics;
+Ctrl+C, startup errors or export failure can still bypass normal saving. See
+SERIAL_STALL_FIX.md for transport buffering, progress timeouts and verification.
+These scripts do not promise crash-proof persistence.
