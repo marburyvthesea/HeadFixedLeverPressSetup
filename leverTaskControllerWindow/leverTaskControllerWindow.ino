@@ -7,6 +7,8 @@
   Configure while stopped:
     SET_TASK,IMMEDIATE / TRIAL / WINDOW / OMISSION -> ACK_TASK,<task>
     SET_ACTIVE,BOTH / LEVER1 / LEVER2 -> ACK_ACTIVE,<selection>
+    SET_PRESS_LOG,ON / OFF -> ACK_PRESS_LOG,<ON/OFF> (stopped only)
+      Opt-in TRIAL/WINDOW press timing; default OFF and reset OFF by STOP.
     SET_TRIAL,<windowMs>,<pauseMs>,<buzzerMs>,<frequencyHz>
       -> ACK_TRIAL,<same four values>
     SET_WINDOW,<startMinMs>,<startMaxMs>,<lengthMinMs>,<lengthMaxMs>,<seed>
@@ -31,6 +33,17 @@
     [windowStart,windowEnd). Both levers are counted across the full trial.
     Start and length are drawn independently, uniformly in integer ms.
     There is only the trial-onset buzzer; no extra cue at window onset.
+  With SET_PRESS_LOG,ON, TRIAL/WINDOW additionally send on each fresh
+  debounced session press (both levers, including intertrial gaps):
+    PRESS_EVENT,<trial>,<leverId>,<ArduinoMs>,<elapsedMs>,<inTrial>,
+                <selected>,<qualifying>,<phase>
+    In-trial elapsedMs is since trial/buzzer onset; phases are TRIAL or
+    EARLY/WINDOW/LATE. Window start is inclusive and end is exclusive.
+    Intertrial presses use trial=0, elapsedMs=-1, inTrial=0, qualifying=0,
+    phase=INTERTRIAL. selected still reports SET_ACTIVE membership.
+    Timestamps are millis() at debounced detection, not MATLAB receipt time.
+    Event logging does not change counts, reward eligibility, or old records.
+    IMMEDIATE/OMISSION never send PRESS_EVENT; older scripts leave it OFF.
   OMISSION: INTERVAL_START,<number>,<startMs>
     Selected-lever press before the deadline:
       LEVER_PRESS,<number>,<leverId>,<pressDetectionMs>
@@ -91,6 +104,7 @@ TaskMode taskMode = IMMEDIATE;
 TrialState trialState = NO_TRIAL;
 byte activeLever = 0; // 0=BOTH, 1=LEVER1, 2=LEVER2
 bool sessionActive = false, stopPending = false;
+bool pressLogEnabled = false;
 bool valveActive = false, valveGapActive = false;
 unsigned long valveStartedAt = 0, valveClosedAt = 0;
 unsigned long trialWindowMs = 15000, trialPauseMs = 1000;
@@ -138,6 +152,31 @@ bool commandOverflow = false;
 
 bool isActiveLever(byte id) {
   return activeLever == 0 || activeLever == id;
+}
+
+void printPressEvent(byte id, unsigned long nowMs) {
+  if (!pressLogEnabled || (taskMode != TRIAL && taskMode != WINDOW)) return;
+  bool inTrial = trialState == TRIAL_RUNNING;
+  unsigned long elapsedMs = inTrial ? nowMs - trialStartedAt : 0;
+  bool selected = isActiveLever(id);
+  bool qualifying = inTrial && selected;
+  const char *phase = inTrial ? "TRIAL" : "INTERTRIAL";
+  if (inTrial && taskMode == WINDOW) {
+    if (elapsedMs < windowStartOffsetMs) phase = "EARLY";
+    else if (elapsedMs < windowEndOffsetMs) phase = "WINDOW";
+    else phase = "LATE";
+    qualifying = selected && elapsedMs >= windowStartOffsetMs &&
+                 elapsedMs < windowEndOffsetMs;
+  }
+  Serial.print(F("PRESS_EVENT,")); Serial.print(inTrial ? trialNumber : 0);
+  Serial.print(','); Serial.print(id);
+  Serial.print(','); Serial.print(nowMs);
+  Serial.print(',');
+  if (inTrial) Serial.print(elapsedMs); else Serial.print(-1);
+  Serial.print(','); Serial.print(inTrial ? 1 : 0);
+  Serial.print(','); Serial.print(selected ? 1 : 0);
+  Serial.print(','); Serial.print(qualifying ? 1 : 0);
+  Serial.print(','); Serial.println(phase);
 }
 
 void startWater() {
@@ -192,6 +231,7 @@ void finishStopIfReady() {
 
 void requestStop() {
   sessionActive = false;
+  pressLogEnabled = false;
   noTone(buzzerPin);
   if (trialState == TRIAL_RUNNING) {
     if (taskMode == OMISSION) {
@@ -283,6 +323,7 @@ void serviceTrial(unsigned long nowMs) {
 
 void handlePress(byte id, unsigned long nowMs) {
   if (!sessionActive) return;
+  printPressEvent(id, nowMs);
   if (taskMode == TRIAL || taskMode == WINDOW || taskMode == OMISSION) {
     if (trialState != TRIAL_RUNNING) return;
     if (id == 1) trialLever1++; else trialLever2++;
@@ -426,7 +467,13 @@ void handleCommand() {
     Serial.println(F("ERROR,STOP_BEFORE_CONFIGURING"));
     return;
   }
-  if (strncmp(commandBuffer, "SET_TASK,", 9) == 0) {
+  if (strncmp(commandBuffer, "SET_PRESS_LOG,", 14) == 0) {
+    const char *value = commandBuffer + 14;
+    if (strcmp(value, "ON") == 0) pressLogEnabled = true;
+    else if (strcmp(value, "OFF") == 0) pressLogEnabled = false;
+    else { Serial.println(F("ERROR,INVALID_PRESS_LOG")); return; }
+    Serial.print(F("ACK_PRESS_LOG,")); Serial.println(value);
+  } else if (strncmp(commandBuffer, "SET_TASK,", 9) == 0) {
     const char *value = commandBuffer + 9;
     if (strcmp(value, "IMMEDIATE") == 0) taskMode = IMMEDIATE;
     else if (strcmp(value, "TRIAL") == 0) taskMode = TRIAL;
@@ -551,3 +598,4 @@ void loop() {
   servicePressQueue(millis());
   finishStopIfReady();
 }
+

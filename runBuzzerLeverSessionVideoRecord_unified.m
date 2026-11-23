@@ -2,10 +2,13 @@
 % ver
 %% runBuzzerLeverSessionVideoRecord_unified.m
 %
-% Controls leverTaskControllerWindow.in in TRIAL mode.
-% Run sections in order; run MAIN LOOP promptly after START SESSION.
+% Controls leverTaskControllerWindow.ino in TRIAL mode.
+% Setup sections can be run separately. START SESSION continues through saving.
 % Each completed window earns ONE reward if the active lever was pressed.
-% Both levers are counted. Intertrial presses are not counted or rewarded.
+% Both levers are counted. Intertrial presses are logged separately and never rewarded.
+%
+% Each MAT file also contains pressEvents and pressEventInfo.
+% Firmware press logging must be acknowledged before START.
 %
 % Protocol implemented (must match the Arduino sketch):
 %   Arduino -> "READY"                          on boot
@@ -114,6 +117,8 @@ trialValues = sprintf('%d,%d,%d,%d', trialSettingsMs(1), trialSettingsMs(2), ...
     trialSettingsMs(3), buzzerFrequencyHz);
 commands = ["SET_TASK,TRIAL", "SET_ACTIVE," + activeLevers, "SET_TRIAL," + trialValues];
 expectedAcks = ["ACK_TASK,TRIAL", "ACK_ACTIVE," + activeLevers, "ACK_TRIAL," + trialValues];
+commands(end+1) = "SET_PRESS_LOG,ON";
+expectedAcks(end+1) = "ACK_PRESS_LOG,ON";
 for configIndex = 1:numel(commands)
     writeline(s, commands(configIndex));
     if ~waitForLine(s, expectedAcks(configIndex), ackTimeout)
@@ -152,6 +157,13 @@ sessionStart = datetime('now');
 sessionEnd   = sessionStart + minutes(sessionMinutes);
 fprintf("Session started at %s. Will run until %s (%.1f min).\n", ...
     datestr(sessionStart), datestr(sessionEnd), sessionMinutes);
+
+% Individual press records, including both levers and intertrial presses.
+pressEventData = zeros(0,7);
+pressEventPhase = strings(0,1);
+pressEventHostTime = datetime.empty(0,1);
+pressEventMessagesValid = true;
+firstTrialArduinoMs = NaN;
 
 % One row per completed or aborted trial.
 trialNum = zeros(0,1);
@@ -197,13 +209,42 @@ while running
     tokens = strsplit(line, ",");
 
     switch tokens{1}
+        case "PRESS_EVENT"
+            try
+                [eventData,eventPhase] = parsePressEvent(line,sessionTaskMode,sessionActiveLevers);
+                pressEventData(end+1,:) = eventData;
+                pressEventPhase(end+1,1) = eventPhase;
+                pressEventHostTime(end+1,1) = datetime('now');
+            catch eventError
+                pressEventMessagesValid = false;
+                warning("Invalid press event: %s (%s)",char(line),eventError.message);
+                if ~stopRequested
+                    writeline(s,"STOP"); stopRequested = true; stopTimer = tic;
+                end
+            end
+
         case "TRIAL_START"
+            if numel(tokens)~=3 || any(~isfinite(str2double(tokens(2:3)))) || ...
+                    any(str2double(tokens(2:3))<0) || ...
+                    any(str2double(tokens(2:3))~=fix(str2double(tokens(2:3)))) || ...
+                    str2double(tokens{2})<1 || str2double(tokens{3})>=2^32
+                pressEventMessagesValid = false;
+                warning("Malformed trial-start record: %s",char(line));
+                if ~stopRequested
+                    writeline(s,"STOP"); stopRequested = true; stopTimer = tic;
+                end
+                continue;
+            end
+            if isnan(firstTrialArduinoMs)
+                firstTrialArduinoMs = str2double(tokens{3});
+            end
             currentTrialStartTime = datetime('now');
             fprintf("[%s] Trial %s started.\n", ...
                 datestr(currentTrialStartTime,'HH:MM:SS'), tokens{2});
 
         case {"TRIAL_END", "TRIAL_ABORT"}
             if numel(tokens) ~= 10
+                pressEventMessagesValid = false;
                 warning("Malformed trial record: %s", char(line));
                 if ~stopRequested
                     writeline(s, "STOP");
@@ -255,6 +296,7 @@ while running
             running = false;
 
         case {"ERROR", "READY"}
+            pressEventMessagesValid = false;
             warning("Arduino error/reset: %s", char(line));
             if ~stopRequested
                 writeline(s, "STOP");
@@ -269,17 +311,22 @@ end
 actualSessionEnd = datetime('now');
 actualMinutes = seconds(actualSessionEnd - sessionStart) / 60;
 disp('experiment over')
-stop(vid);               % stops acquisition; file is already on disk
-closepreview(vid);
+% Drain disk logging before saving; video cleanup errors do not discard events.
 try
-    close(vw);           % close writer explicitly (good hygiene)
-catch
+    stop(vid); diskTimer = tic;
+    while vid.DiskLoggerFrameCount < vid.FramesAcquired && toc(diskTimer)<15
+        pause(0.05);
+    end
+catch videoError
+    warning("Video cleanup issue: %s",videoError.message);
 end
-delete(vid);
+try closepreview(vid); catch, end
+try close(vw); catch, end
+try delete(vid); catch, end
 clear vid
 disp(['Video saved as ', fileName]);
 % ===================== CLEAN UP =====================
-delete(s);
+try delete(s); catch, end
 fprintf("Serial connection closed.\n");
 
 results = table(trialNum, trialStartWallClock, trialEndWallClock, pressCount, ...
@@ -290,6 +337,10 @@ results = table(trialNum, trialStartWallClock, trialEndWallClock, pressCount, ..
     'ArduinoStartMs','ArduinoEndMs'});
 results.ActiveLevers = repmat(sessionActiveLevers, height(results), 1);
 
+[pressEvents,pressEventInfo] = makePressEventTable(pressEventData,pressEventPhase, ...
+    pressEventHostTime,firstTrialArduinoMs,trialNum,lever1Presses,lever2Presses, ...
+    activePresses,stopAcknowledged,pressEventMessagesValid);
+
 fprintf("\nSession complete: %d completed, %d aborted trials in %.2f minutes.\n", ...
     sum(trialCompleted), sum(~trialCompleted), actualMinutes);
 disp(results);
@@ -299,11 +350,12 @@ if saveResults
     sessionOutputBase = string(fullfile(newDirectory, sprintf('%s_%s', outFileBase, timestamp)));
     csvName = sessionOutputBase + ".csv";
     matName = sessionOutputBase + ".mat";
-    save(matName, 'results', 'sessionStart', 'sessionEnd', 'sessionMinutes', ...
+    save(matName, 'results', 'pressEvents', 'pressEventInfo', 'sessionStart', 'sessionEnd', 'sessionMinutes', ...
         'actualSessionEnd', 'actualMinutes', 'stopAcknowledged', 'sessionTaskMode', ...
         'sessionActiveLevers', 'sessionTrialSeconds', 'sessionInterTrialSeconds', ...
         'sessionBuzzerSeconds', 'sessionBuzzerFrequencyHz');
     writetable(results, csvName);
+    writetable(pressEvents,sessionOutputBase + "_presses.csv");
     txtName = sessionOutputBase + ".txt";
     fid = fopen(txtName, 'w');
     if fid == -1
@@ -315,9 +367,14 @@ if saveResults
     fprintf(fid, "Trial window: %.3f seconds\n", sessionTrialSeconds);
     fprintf(fid, "Pause after reward completion/unrewarded trial: %.3f seconds\n", sessionInterTrialSeconds);
     fprintf(fid, "Buzzer: %.3f seconds at %d Hz\n", sessionBuzzerSeconds, sessionBuzzerFrequencyHz);
-    fprintf(fid, "Reward rule: one 220 ms valve pulse at completed trial end if ActivePresses > 0.\n");
+    fprintf(fid, "Reward rule: one 350 ms valve pulse at completed trial end if ActivePresses > 0.\n");
+    fprintf(fid, "Individual press log: %d records; in-trial counts match=%d; valid messages=%d.\n", ...
+        height(pressEvents),pressEventInfo.TrialCountsMatch,pressEventInfo.MessagesValid);
+    fprintf(fid, "Press timing: Arduino debounced detection at 1 ms resolution, 10 ms debounce.\n");
+    fprintf(fid, "TrialTimeSeconds is relative to trial/buzzer onset; ITI uses Trial=0 and NaN.\n");
+    fprintf(fid, "SessionTimeSeconds is relative to first trial/buzzer onset; HostReceivedAt is receipt time.\n");
     fprintf(fid, "WaterDelivered is a valve command, not measured water flow.\n");
-    fprintf(fid, "Incomplete trials receive no reward. Between-trial presses are ignored.\n");
+    fprintf(fid, "Incomplete trials receive no reward. Between-trial presses are logged but do not count or earn reward.\n");
     fprintf(fid, "Completed trials: %d\nAborted trials: %d\n", sum(trialCompleted), sum(~trialCompleted));
     fprintf(fid, "Lever 1 presses: %d\nLever 2 presses: %d\nActive presses: %d\n", ...
         sum(lever1Presses), sum(lever2Presses), sum(activePresses));
@@ -352,5 +409,70 @@ function found = waitForLine(s, expectedPrefix, timeoutSec)
         else
             pause(0.02);
         end
+    end
+end
+
+
+function [data,phase] = parsePressEvent(line,taskMode,activeLevers)
+% PRESS_EVENT,trial,lever,ArduinoMs,elapsedMs,inTrial,selected,qualifying,phase
+    tokens = split(string(line),",");
+    assert(numel(tokens)==9 && tokens(1)=="PRESS_EVENT",'Expected nine press-event fields.');
+    data = str2double(tokens(2:8))';
+    assert(all(isfinite(data)) && all(data==fix(data)),'Press-event values must be finite integers.');
+    assert(data(1)>=0 && ismember(data(2),[1 2]) && data(3)>=0 && data(3)<2^32, ...
+        'Invalid trial, lever or Arduino clock.');
+    assert(all(ismember(data(5:7),[0 1])),'Invalid press-event flags.');
+    phase = tokens(9);
+    selected = activeLevers=="BOTH" || activeLevers=="LEVER"+string(data(2));
+    assert(data(6)==selected,'Press-event lever selection disagrees with session settings.');
+    if data(5)==0
+        assert(data(1)==0 && data(4)==-1 && data(7)==0 && phase=="INTERTRIAL", ...
+            'Invalid intertrial event.');
+    else
+        assert(data(1)>=1 && data(4)>=0 && data(4)<2^32,'Invalid trial-relative timing.');
+        if taskMode=="TRIAL"
+            assert(phase=="TRIAL",'Invalid full-trial phase.');
+        else
+            assert(taskMode=="WINDOW" && ismember(phase,["EARLY","WINDOW","LATE"]), ...
+                'Invalid random-window phase.');
+        end
+        qualifying = selected && ismember(phase,["TRIAL","WINDOW"]);
+        assert(data(7)==qualifying,'Invalid qualifying-press flag.');
+    end
+end
+
+function [events,info] = makePressEventTable(data,phase,hostTime,firstMs, ...
+        trials,lever1Counts,lever2Counts,qualifyingCounts,acknowledged,messagesValid)
+% Keep raw Arduino clock values; derive relative seconds without host latency.
+    trialTime = data(:,4)/1000;
+    trialTime(data(:,5)==0) = NaN;
+    if isfinite(firstMs)
+        sessionTime = mod(data(:,3)-firstMs,2^32)/1000;
+    else
+        sessionTime = NaN(size(data,1),1);
+    end
+    events = table(data(:,1),data(:,2),data(:,3),data(:,4),trialTime,sessionTime, ...
+        logical(data(:,5)),logical(data(:,6)),logical(data(:,7)),phase,hostTime, ...
+        'VariableNames',{'Trial','LeverID','ArduinoMs','TrialElapsedMs', ...
+        'TrialTimeSeconds','SessionTimeSeconds','InTrial','SelectedLever', ...
+        'Qualifying','Phase','HostReceivedAt'});
+    % Summaries contain only in-trial counts, so ITI completeness cannot be
+    % inferred from this check. These flags expose malformed/missing trial data.
+    countsMatch = all(ismember(events.Trial(events.InTrial),trials));
+    for k = 1:numel(trials)
+        selectedRows = events.InTrial & events.Trial==trials(k);
+        countsMatch = countsMatch && sum(selectedRows & events.LeverID==1)==lever1Counts(k) && ...
+            sum(selectedRows & events.LeverID==2)==lever2Counts(k) && ...
+            sum(selectedRows & events.Qualifying)==qualifyingCounts(k);
+    end
+    info = struct('ProtocolVersion',1,'Enabled',true,'MessagesValid',messagesValid, ...
+        'TrialCountsMatch',countsMatch,'StopAcknowledged',acknowledged, ...
+        'ClockOriginValid',isfinite(firstMs),'SessionStartArduinoMs',firstMs,'TimestampResolutionMs',1,'DebounceMs',10, ...
+        'SessionClockOrigin',"First trial/buzzer onset", ...
+        'IntertrialConvention',"Trial=0, TrialElapsedMs=-1, TrialTimeSeconds=NaN", ...
+        'TimingMeaning',"Arduino time of a new debounced press; HostReceivedAt is receipt time only");
+    if ~countsMatch || ~messagesValid || ~acknowledged || ~isfinite(firstMs)
+        warning('PressTiming:IncompleteLog', ...
+            'Press-event verification incomplete. Inspect pressEventInfo and the trial summaries.');
     end
 end
