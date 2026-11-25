@@ -4,6 +4,32 @@
   Buzzer=5. Pin 7 -> active-HIGH external solenoid driver.
   NEVER connect the 24 V valve directly to an Arduino pin.
 
+  Opt-in trial-buffered press logging (TRIAL/WINDOW):
+    Configure SET_TASK first, then SET_PRESS_LOG,BATCH.
+    -> ACK_PRESS_LOG,BATCH,1024,<solenoidMs>. OFF restores the legacy protocol.
+    No USB output occurs during a timed batch trial or its reward pulse.
+    Both levers' in-trial timestamps are retained in 1024 uint32 words (4 KiB).
+    packedWord = (elapsedMs << 1) | (leverId - 1). Raw time is startMs+elapsedMs
+    modulo 2^32. Intertrial presses are neither captured nor rewarded.
+    GET_BATCH -> BATCH_EMPTY, or after hardware is quiet:
+      BATCH_READY,<trial>,<stored>,<dropped>,<completed>,<water>,<acknowledged>
+    GET_META,<trial> -> META,<trial>,<startMs>,<endMs>
+    GET_COUNTS,<trial> -> COUNTS,<trial>,<lever1>,<lever2>,<activeCount>
+    GET_WINDOW,<trial> -> WINDOW,<trial>,<startOffsetMs>,<endOffsetMs>
+    GET_CONTEXT,<trial> -> CONTEXT,<trial>,<TRIAL|WINDOW>,<activeLevers>,<solenoidMs>
+    GET_PRESS,<trial>,<1-based first> -> PRESS_DATA,<trial>,<first>,<word1>[,<word2>,<word3>,<word4>]
+      Returns up to four consecutive packed words (the final page may be short).
+    ACK_BATCH,<trial> -> ACK_BATCH,<trial>; retain data until the next BATCH trial.
+    All pull responses are single lines shorter than 64 bytes including CRLF.
+    The host keeps only one command outstanding, checkpoints data, ACKs it,
+    then sends CONTINUE. Reads/ACKs are idempotent. Unacknowledged data blocks
+    reconfiguration and a new session; read it before reusing the controller.
+    STOP cancels any pending GET_BATCH and acknowledges after the pulse closes.
+    Buffer overflow aborts the incomplete trial without reward, stops the
+    session and preserves stored words/counts with a nonzero dropped count.
+    RAM is volatile: resetting/powering off the board loses retained data.
+    Legacy IMMEDIATE/OMISSION and OFF task behavior are unchanged.
+
   Configure while stopped:
     SET_TASK,IMMEDIATE / TRIAL / WINDOW / OMISSION -> ACK_TASK,<task>
     SET_ACTIVE,BOTH / LEVER1 / LEVER2 -> ACK_ACTIVE,<selection>
@@ -59,7 +85,7 @@
 const byte buzzerPin = 5;
 const byte solenoidPin = 7;
 const unsigned long debounceMs = 10;
-const unsigned long solenoidMs = 350;
+const unsigned long solenoidMs = 325; // Rig setting supplied by the user.
 const unsigned long valveClosedGapMs = 50;
 
 enum TaskMode { IMMEDIATE, TRIAL, WINDOW, OMISSION };
@@ -112,6 +138,93 @@ unsigned long omissionRewardPauseMs = 1000;
 unsigned long omissionBuzzerMs = 500;
 unsigned long omissionBuzzerHz = 4000;
 bool omissionConfigured = false;
+
+const uint16_t batchCapacity = 1024;
+uint32_t batchPressWords[batchCapacity];
+uint16_t batchPressCount = 0;
+unsigned long batchDropped = 0;
+bool batchLogging = false;
+bool batchReadPending = false;
+uint32_t batchReadTarget = 0;
+const char *batchDeferredError = nullptr;
+struct BatchSnapshot {
+  bool valid, acknowledged, completed, water;
+  uint32_t trial, startMs, endMs;
+  unsigned long lever1, lever2, active;
+  unsigned long windowStart, windowEnd;
+  TaskMode mode;
+  byte selected;
+};
+BatchSnapshot batchSnapshot = {};
+
+bool batchCritical() {
+  return batchLogging && (taskMode == TRIAL || taskMode == WINDOW) &&
+         (trialState == TRIAL_RUNNING || valveActive);
+}
+
+void freezeBatch(bool completed, bool water, unsigned long nowMs) {
+  batchSnapshot.valid = true;
+  batchSnapshot.acknowledged = false;
+  batchSnapshot.completed = completed;
+  batchSnapshot.water = water;
+  batchSnapshot.trial = (uint32_t)trialNumber;
+  batchSnapshot.startMs = (uint32_t)trialStartedAt;
+  batchSnapshot.endMs = (uint32_t)nowMs;
+  batchSnapshot.lever1 = trialLever1;
+  batchSnapshot.lever2 = trialLever2;
+  batchSnapshot.active = trialActivePresses;
+  batchSnapshot.windowStart = taskMode == WINDOW ? windowStartOffsetMs : 0;
+  batchSnapshot.windowEnd = taskMode == WINDOW ? windowEndOffsetMs : trialWindowMs;
+  batchSnapshot.mode = taskMode;
+  batchSnapshot.selected = activeLever;
+}
+
+void captureBatchPress(byte id, unsigned long nowMs) {
+  if (!batchLogging) return;
+  unsigned long elapsedMs = nowMs - trialStartedAt;
+  if (batchPressCount < batchCapacity) {
+    batchPressWords[batchPressCount++] = ((uint32_t)elapsedMs << 1) | (uint32_t)(id - 1);
+    return;
+  }
+  // Stop without any Serial call. The triggering press remains in counters,
+  // but is explicitly reported as a lost timestamp in the immutable snapshot.
+  batchDropped++;
+  freezeBatch(false, false, nowMs);
+  noTone(buzzerPin);
+  sessionActive = false;
+  trialState = NO_TRIAL;
+  continueRequested = false;
+}
+
+const char *activeName(byte selection) {
+  return selection == 1 ? "LEVER1" : (selection == 2 ? "LEVER2" : "BOTH");
+}
+
+void printBatchReady() {
+  if (!batchSnapshot.valid) {
+    Serial.println(F("BATCH_EMPTY"));
+    return;
+  }
+  Serial.print(F("BATCH_READY,")); Serial.print(batchSnapshot.trial);
+  Serial.print(','); Serial.print(batchPressCount);
+  Serial.print(','); Serial.print(batchDropped);
+  Serial.print(','); Serial.print(batchSnapshot.completed ? 1 : 0);
+  Serial.print(','); Serial.print(batchSnapshot.water ? 1 : 0);
+  Serial.print(','); Serial.println(batchSnapshot.acknowledged ? 1 : 0);
+}
+
+void serviceBatchReplies() {
+  if (batchCritical()) return;
+  if (batchDeferredError != nullptr) {
+    Serial.print(F("ERROR,")); Serial.println(batchDeferredError);
+    batchDeferredError = nullptr;
+  }
+  if (batchReadPending && batchSnapshot.valid && batchSnapshot.trial == batchReadTarget) {
+    batchReadPending = false;
+    printBatchReady();
+  }
+}
+
 
 // xorshift32 has a nonzero state and generates 1..UINT32_MAX.
 // Rejection sampling avoids modulo bias for integer-millisecond ranges.
@@ -199,10 +312,13 @@ void requestStop() {
       Serial.print(trialNumber);
       Serial.print(F(",ABORT,"));
       Serial.println(trialLever1 + trialLever2);
+    } else if (batchLogging) {
+      freezeBatch(false, false, millis());
     } else {
       printTrialResult(false, false, millis());
     }
   }
+  batchReadPending = false; batchReadTarget = 0; // STOP supersedes a pending pull.
   trialState = NO_TRIAL;
   continueRequested = false;
   stopPending = true;
@@ -218,12 +334,18 @@ void beginTrial(unsigned long nowMs) {
     windowEndOffsetMs = windowStartOffsetMs +
         drawWindowValue(windowLengthMinMs, windowLengthMaxMs);
   }
+  if (batchLogging && (taskMode == TRIAL || taskMode == WINDOW)) {
+    batchPressCount = 0; batchDropped = 0;
+    batchSnapshot.valid = false; batchSnapshot.acknowledged = false;
+    batchDeferredError = nullptr; // A pull requested in the preceding gap survives.
+  }
   trialStartedAt = nowMs;
   trialState = TRIAL_RUNNING;
   continueRequested = false;
   unsigned long cueMs = taskMode == OMISSION ? omissionBuzzerMs : buzzerMs;
   unsigned long cueHz = taskMode == OMISSION ? omissionBuzzerHz : buzzerHz;
   if (cueMs > 0) tone(buzzerPin, (unsigned int)cueHz, cueMs);
+  if (batchLogging && (taskMode == TRIAL || taskMode == WINDOW)) return;
   if (taskMode == OMISSION) Serial.print(F("INTERVAL_START,"));
   else Serial.print(taskMode == WINDOW ? F("WINDOW_START,") : F("TRIAL_START,"));
   Serial.print(trialNumber);
@@ -269,7 +391,8 @@ void serviceTrial(unsigned long nowMs) {
     bool water = trialActivePresses > 0;
     if (water) startWater();
     trialState = WAIT_REWARD;
-    printTrialResult(true, water, nowMs);
+    if (batchLogging) freezeBatch(true, water, nowMs);
+    else printTrialResult(true, water, nowMs);
   }
   if (trialState == WAIT_REWARD && !valveActive) {
     trialGapStartedAt = nowMs;
@@ -317,6 +440,7 @@ void handlePress(byte id, unsigned long nowMs) {
       }
     }
     if (isActiveLever(id) && inWindow) trialActivePresses++;
+    captureBatchPress(id, nowMs);
     return;
   }
   if (queueCount >= queueCapacity) {
@@ -420,19 +544,136 @@ bool parseOmissionSettings(const char *text, unsigned long values[5]) {
          values[4] >= 31 && values[4] <= 20000;
 }
 
+bool parseBatchQuery(const char *text, uint32_t values[2], byte fields) {
+  const uint32_t maxValue = UINT32_MAX;
+  for (byte i = 0; i < fields; i++) {
+    if (*text < '0' || *text > '9') return false;
+    uint32_t n = 0;
+    while (*text >= '0' && *text <= '9') {
+      uint32_t digit = (uint32_t)(*text++ - '0');
+      if (n > (maxValue - digit) / 10U) return false;
+      n = n * 10U + digit;
+    }
+    values[i] = n;
+    if (i + 1 < fields) { if (*text++ != ',') return false; }
+    else if (*text != '\0') return false;
+  }
+  return values[0] >= 1;
+}
+
+bool batchQuery(const char *text, uint32_t values[2], byte fields) {
+  if (!parseBatchQuery(text, values, fields)) {
+    Serial.println(F("ERROR,INVALID_BATCH_QUERY")); return false;
+  }
+  if (!batchSnapshot.valid || values[0] != batchSnapshot.trial) {
+    Serial.println(F("ERROR,BATCH_NOT_FOUND")); return false;
+  }
+  return true;
+}
+
 void handleCommand() {
   commandBuffer[commandLength] = '\0';
+  if (batchCritical()) {
+    if (strcmp(commandBuffer, "STOP") == 0) requestStop();
+    else if (strcmp(commandBuffer, "GET_BATCH") == 0) {
+      batchReadPending = true; batchReadTarget = (uint32_t)trialNumber;
+    }
+    else if (commandLength > 0) batchDeferredError = "BATCH_BUSY";
+    return; // Never send any command response while timing hardware.
+  }
+  if (strcmp(commandBuffer, "STOP") == 0) {
+    requestStop(); return;
+  }
+  if (strcmp(commandBuffer, "GET_BATCH") == 0) {
+    if (batchLogging && sessionActive && continueRequested) {
+      // ACK_CONTINUE precedes the configured pause. This pull is for the
+      // upcoming trial, not the acknowledged snapshot still held in RAM.
+      batchReadPending = true; batchReadTarget = (uint32_t)(trialNumber + 1UL);
+    } else printBatchReady();
+    return;
+  }
+  uint32_t queryValues[2] = {};
+  if (strncmp(commandBuffer, "GET_META,", 9) == 0) {
+    if (!batchQuery(commandBuffer + 9, queryValues, 1)) return;
+    Serial.print(F("META,")); Serial.print(batchSnapshot.trial);
+    Serial.print(','); Serial.print(batchSnapshot.startMs);
+    Serial.print(','); Serial.println(batchSnapshot.endMs);
+    return;
+  }
+  if (strncmp(commandBuffer, "GET_COUNTS,", 11) == 0) {
+    if (!batchQuery(commandBuffer + 11, queryValues, 1)) return;
+    Serial.print(F("COUNTS,")); Serial.print(batchSnapshot.trial);
+    Serial.print(','); Serial.print(batchSnapshot.lever1);
+    Serial.print(','); Serial.print(batchSnapshot.lever2);
+    Serial.print(','); Serial.println(batchSnapshot.active);
+    return;
+  }
+  if (strncmp(commandBuffer, "GET_WINDOW,", 11) == 0) {
+    if (!batchQuery(commandBuffer + 11, queryValues, 1)) return;
+    Serial.print(F("WINDOW,")); Serial.print(batchSnapshot.trial);
+    Serial.print(','); Serial.print(batchSnapshot.windowStart);
+    Serial.print(','); Serial.println(batchSnapshot.windowEnd);
+    return;
+  }
+  if (strncmp(commandBuffer, "GET_CONTEXT,", 12) == 0) {
+    if (!batchQuery(commandBuffer + 12, queryValues, 1)) return;
+    Serial.print(F("CONTEXT,")); Serial.print(batchSnapshot.trial);
+    Serial.print(','); Serial.print(batchSnapshot.mode == WINDOW ? F("WINDOW") : F("TRIAL"));
+    Serial.print(','); Serial.print(activeName(batchSnapshot.selected));
+    Serial.print(','); Serial.println(solenoidMs);
+    return;
+  }
+  if (strncmp(commandBuffer, "GET_PRESS,", 10) == 0) {
+    if (!batchQuery(commandBuffer + 10, queryValues, 2)) return;
+    uint32_t index = queryValues[1];
+    if (index < 1 || index > batchPressCount) {
+      Serial.println(F("ERROR,PRESS_INDEX_RANGE")); return;
+    }
+    Serial.print(F("PRESS_DATA,")); Serial.print(batchSnapshot.trial);
+    Serial.print(','); Serial.print(index);
+    uint16_t end = (uint16_t)index + 3;
+    if (end > batchPressCount) end = batchPressCount;
+    for (uint16_t entry = (uint16_t)index; entry <= end; entry++) {
+      Serial.print(','); Serial.print(batchPressWords[entry - 1]);
+    }
+    Serial.println();
+    return;
+  }
+  if (strncmp(commandBuffer, "ACK_BATCH,", 10) == 0) {
+    if (!batchQuery(commandBuffer + 10, queryValues, 1)) return;
+    batchSnapshot.acknowledged = true;
+    Serial.print(F("ACK_BATCH,")); Serial.println(batchSnapshot.trial);
+    return;
+  }
   if (strncmp(commandBuffer, "SET_", 4) == 0 && (sessionActive || stopPending)) {
     Serial.println(F("ERROR,STOP_BEFORE_CONFIGURING"));
     return;
   }
-  if (strncmp(commandBuffer, "SET_TASK,", 9) == 0) {
+  if (strncmp(commandBuffer, "SET_", 4) == 0 &&
+      batchSnapshot.valid && !batchSnapshot.acknowledged) {
+    Serial.println(F("ERROR,DATA_PENDING")); return;
+  }
+  if (strncmp(commandBuffer, "SET_PRESS_LOG,", 14) == 0) {
+    const char *value = commandBuffer + 14;
+    if (strcmp(value, "BATCH") == 0) {
+      if (taskMode != TRIAL && taskMode != WINDOW) {
+        Serial.println(F("ERROR,BATCH_REQUIRES_TRIAL")); return;
+      }
+      batchLogging = true;
+      Serial.print(F("ACK_PRESS_LOG,BATCH,")); Serial.print(batchCapacity);
+      Serial.print(','); Serial.println(solenoidMs);
+    } else if (strcmp(value, "OFF") == 0) {
+      batchLogging = false;
+      Serial.println(F("ACK_PRESS_LOG,OFF"));
+    } else Serial.println(F("ERROR,USE_BATCH_MODE"));
+  } else if (strncmp(commandBuffer, "SET_TASK,", 9) == 0) {
     const char *value = commandBuffer + 9;
     if (strcmp(value, "IMMEDIATE") == 0) taskMode = IMMEDIATE;
     else if (strcmp(value, "TRIAL") == 0) taskMode = TRIAL;
     else if (strcmp(value, "WINDOW") == 0) taskMode = WINDOW;
     else if (strcmp(value, "OMISSION") == 0) taskMode = OMISSION;
     else { Serial.println(F("ERROR,INVALID_TASK")); return; }
+    batchLogging = false; // Legacy scripts do not request the optional protocol.
     Serial.print(F("ACK_TASK,")); Serial.println(value);
   } else if (strncmp(commandBuffer, "SET_ACTIVE,", 11) == 0) {
     const char *value = commandBuffer + 11;
@@ -485,6 +726,9 @@ void handleCommand() {
       if (i < 4) Serial.print(','); else Serial.println();
     }
   } else if (strcmp(commandBuffer, "START") == 0) {
+    if (batchSnapshot.valid && !batchSnapshot.acknowledged) {
+      Serial.println(F("ERROR,DATA_PENDING")); return;
+    }
     if (stopPending) { Serial.println(F("ERROR,STOP_IN_PROGRESS")); return; }
     if (taskMode == WINDOW && !windowConfigured) {
       Serial.println(F("ERROR,CONFIGURE_WINDOW_BEFORE_START")); return;
@@ -505,6 +749,9 @@ void handleCommand() {
     Serial.println(F("ACK_START"));
     if (newSession && taskMode != IMMEDIATE) beginTrial(millis());
   } else if (strcmp(commandBuffer, "CONTINUE") == 0) {
+    if (batchLogging && (!batchSnapshot.valid || !batchSnapshot.acknowledged)) {
+      Serial.println(F("ERROR,DATA_PENDING")); return;
+    }
     if (sessionActive && (taskMode == TRIAL || taskMode == WINDOW) &&
         (trialState == WAIT_REWARD || trialState == TRIAL_GAP)) {
       continueRequested = true;
@@ -518,9 +765,14 @@ void handleCommand() {
 void readCommands() {
   byte bytesRead = 0;
   while (Serial.available() > 0 && bytesRead++ < 32) {
-    char c = Serial.read();
+    int incoming = Serial.read();
+    if (incoming < 0) break; // Some USB cores report bytes before DTR permits read.
+    char c = (char)incoming;
     if (c == '\n') {
-      if (commandOverflow) Serial.println(F("ERROR,COMMAND_TOO_LONG"));
+      if (commandOverflow) {
+        if (batchCritical()) batchDeferredError = "COMMAND_TOO_LONG";
+        else Serial.println(F("ERROR,COMMAND_TOO_LONG"));
+      }
       else handleCommand();
       commandLength = 0; commandOverflow = false;
     } else if (c != '\r') {
@@ -550,4 +802,6 @@ void loop() {
   serviceWater(millis());
   servicePressQueue(millis());
   finishStopIfReady();
+  serviceBatchReplies();
 }
+
