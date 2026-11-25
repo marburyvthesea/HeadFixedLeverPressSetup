@@ -62,6 +62,17 @@ that this matches your calibration; it does not infer measured water flow.
 `saveResults=true` is required: BATCH mode does not acknowledge and overwrite
 RAM records unless their MAT checkpoint has been finalized successfully.
 
+The MATLAB runner update fixes first-trial storage into empty structure arrays
+and removes the cleanup callback's dependence on an exiting nested workspace.
+It also saves `session.ErrorIdentifier` and `session.ErrorReport` for diagnosis.
+This is a MATLAB-only correction: no Arduino upload or calibration change is
+needed. Preserve any local script settings when pulling the branch.
+
+If a previous attempt failed after capturing a trial, keep the board powered
+and avoid resetting or reflashing it. The updated runner first saves any
+unacknowledged retained trial into a separate recovery MAT before proceeding.
+Keep the original failed session folder as well; it may contain decoded tables.
+
 ## What changes operationally
 
 - Capture covers **in-trial presses only**, both selected and unselected levers,
@@ -148,7 +159,13 @@ The MATLAB path was independently reviewed. Decoder tests are included:
 ```matlab
 addpath('tests');
 test_buffered_decoder
+test_buffered_runner
 ```
+
+`test_buffered_runner` exercises the actual camera-free session runner with a
+temporary mock serial factory. It checks first/subsequent trial storage and
+that checkpoints exist before device acknowledgments. It does not contact an
+Arduino or replace the production serial factory outside the test.
 
 MATLAB execution, Arduino IDE/board compilation and a physical USB/camera test
 were unavailable here. Those MATLAB tests have not been run by this agent.

@@ -3,6 +3,9 @@ function [results,pressEvents,session] = runBufferedLeverSession(settings)
 % Do not mix this runner with the live-stream or generic TX-queue firmware.
 settings = validateSettings(settings);
 s = []; vid = []; writer = []; rx = ''; serialLog = -1;
+resources = containers.Map('KeyType','char','ValueType','any');
+resources('Serial') = []; resources('Video') = []; resources('Writer') = [];
+resources('SerialLog') = -1; resources('StopAcknowledged') = false;
 results = table; pressEvents = table; trialBatches = struct([]); trialInfo = struct([]);
 firstTrialArduinoMs = NaN; sessionClock = []; stopAcknowledged = false;
 readyBeforeStop = []; logBytes = 0; logLines = 0;
@@ -11,14 +14,19 @@ folder = fullfile(settings.videoFolder,settings.mouseID+"_"+stamp);
 [ok,message] = mkdir(folder); assert(ok,'Cannot create session folder: %s',message);
 matFile = fullfile(folder,settings.outFileBase+"_batch.mat");
 session = struct('TaskMode',settings.taskMode,'Settings',settings,'OutputFolder',folder, ...
-    'MatFile',matFile,'Start',NaT,'End',NaT,'Error',"",'StopReason',"", ...
+    'MatFile',matFile,'Start',NaT,'End',NaT,'Error',"",'ErrorIdentifier',"", ...
+    'ErrorReport',"",'StopReason',"", ...
     'StopAcknowledged',false,'DeviceCapacity',NaN,'DeviceSolenoidMs',NaN, ...
     'RecoveredFiles',strings(0,1),'AcknowledgedTrials',zeros(0,1),'SerialBytes',0,'SerialLines',0);
-cleanup = onCleanup(@release);
+% Capture the handle owner by value, without a nested callback into this
+% function's shared workspace: its variables can be gone during teardown.
+cleanup = onCleanup(@() releaseBufferedResources(resources,settings.recordVideo));
 try
     serialLog = fopen(fullfile(folder,'serial.log'),'w');
     assert(serialLog>=0,'Cannot create serial log.');
+    resources('SerialLog') = serialLog;
     s = serialport(settings.portName,settings.baudRate,'Timeout',settings.ackTimeout);
+    resources('Serial') = s;
     configureTerminator(s,"LF");
     try setDTR(s,true); catch dtrError
         warning('LeverBatch:DTR','Could not set DTR: %s',dtrError.message);
@@ -79,11 +87,13 @@ try
     session.DeviceCapacity = values(1); session.DeviceSolenoidMs = values(2);
     if settings.recordVideo || settings.showVideoPreview
         vid = videoinput(char(settings.videoAdaptor),settings.videoDevice,char(settings.videoFormat));
+        resources('Video') = vid;
         source = getselectedsource(vid);
         if strlength(settings.cameraFrameRate)>0, source.FrameRate = char(settings.cameraFrameRate); end
         vid.ReturnedColorSpace = 'grayscale';
         if settings.recordVideo
             writer = VideoWriter(fullfile(folder,settings.mouseID+"_T.avi"),'Motion JPEG AVI');
+            resources('Writer') = writer;
             writer.FrameRate = settings.savedVideoFrameRate; writer.Quality = 75;
             vid.LoggingMode = 'disk'; vid.DiskLogger = writer;
             vid.FramesPerTrigger = Inf; triggerconfig(vid,'immediate'); start(vid);
@@ -120,10 +130,24 @@ try
         end
         if isnan(firstTrialArduinoMs), firstTrialArduinoMs = snapshot.ArduinoStartMs; end
         [row,events,info] = decodeBufferedLeverTrial(snapshot,firstTrialArduinoMs);
-        if isempty(results), results = row; else, results = [results;row]; end
-        if isempty(pressEvents), pressEvents = events; else, pressEvents = [pressEvents;events]; end
-        trialBatches(end+1,1) = snapshot;
-        trialInfo(end+1,1) = info;
+        % Seed fieldless empty struct arrays by whole-variable assignment.
+        % Stage every append before committing the in-memory trial together.
+        if isempty(trialBatches)
+            nextBatches = snapshot;
+        else
+            nextBatches = trialBatches;
+            nextBatches(end+1,1) = orderfields(snapshot,trialBatches(1));
+        end
+        if isempty(trialInfo)
+            nextInfo = info;
+        else
+            nextInfo = trialInfo;
+            nextInfo(end+1,1) = orderfields(info,trialInfo(1));
+        end
+        if isempty(results), nextResults = row; else, nextResults = [results;row]; end
+        if isempty(pressEvents), nextEvents = events; else, nextEvents = [pressEvents;events]; end
+        trialBatches = nextBatches; trialInfo = nextInfo;
+        results = nextResults; pressEvents = nextEvents;
         % This write is mandatory. A failure leaves RAM data unacknowledged.
         checkpoint();
         acknowledge(snapshot.Trial);
@@ -150,10 +174,13 @@ try
     end
 catch err
     session.Error = string(err.message);
+    session.ErrorIdentifier = string(err.identifier);
+    session.ErrorReport = string(getReport(err,'extended','hyperlinks','off'));
     if strlength(session.StopReason)==0, session.StopReason = "Error"; end
     warning('LeverBatch:SessionError','%s. Device data is not silently discarded.',err.message);
 end
 release();
+clear cleanup; % Retire the idempotent guard while this workspace is still alive.
 session.End = datetime('now'); session.StopAcknowledged = stopAcknowledged;
 session.SerialBytes = logBytes; session.SerialLines = logLines;
 try
@@ -336,24 +363,39 @@ if strlength(session.Error)>0, fprintf('Session error: %s\n',session.Error); end
     function release()
         if ~isempty(s)
             try stopController(); catch, end
-            try delete(s); catch, end
-            s = [];
         end
-        if ~isempty(vid)
-            try closepreview(vid); catch, end
-            try
-                stop(vid); timer = tic;
-                while settings.recordVideo && vid.DiskLoggerFrameCount<vid.FramesAcquired && toc(timer)<15
-                    pause(0.05);
-                end
-            catch
-            end
-            try delete(vid); catch, end
-            vid = [];
-        end
-        if ~isempty(writer), try close(writer); catch, end; writer = []; end
-        if serialLog>=0, fclose(serialLog); serialLog = -1; end
+        resources('StopAcknowledged') = stopAcknowledged;
+        releaseBufferedResources(resources,settings.recordVideo);
+        s = []; vid = []; writer = []; serialLog = -1;
     end
+end
+
+function releaseBufferedResources(resources,recordVideo)
+% Independent of the runner's nested workspace; safe on exit or interruption.
+% Clear each owned entry before closing it so repeated cleanup is harmless.
+s = resources('Serial'); resources('Serial') = [];
+if ~isempty(s)
+    if ~resources('StopAcknowledged')
+        try writeline(s,"STOP"); catch, end
+    end
+    try delete(s); catch, end
+end
+vid = resources('Video'); resources('Video') = [];
+if ~isempty(vid)
+    try closepreview(vid); catch, end
+    try
+        stop(vid); videoDrainClock = tic;
+        while recordVideo && vid.DiskLoggerFrameCount<vid.FramesAcquired && toc(videoDrainClock)<15
+            pause(0.05);
+        end
+    catch
+    end
+    try delete(vid); catch, end
+end
+writer = resources('Writer'); resources('Writer') = [];
+if ~isempty(writer), try close(writer); catch, end; end
+serialLog = resources('SerialLog'); resources('SerialLog') = -1;
+if serialLog>=0, try fclose(serialLog); catch, end; end
 end
 
 function header = parseHeader(tokens)
